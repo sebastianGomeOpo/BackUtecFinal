@@ -1,0 +1,60 @@
+# FastAPI and Server
+fastapi==0.115.0
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+python-dotenv==1.0.1
+pydantic==2.10.5
+pydantic-settings==2.7.1
+
+# WebSocket
+python-socketio==5.12.0
+websockets==14.1
+
+# OpenAI - NO SDK (using pure HTTP with httpx)
+# openai==1.59.8  # Removed - using direct API calls
+
+# Gemini (for POC4 - Video multimodal)
+google-genai==1.0.0
+
+# Video Processing (for POC4)
+opencv-python==4.10.0.84
+numpy==2.2.5
+
+# Vector Store (compatible con Python 3.13)
+pinecone==6.0.0
+
+# Database
+motor>=3.7.0
+pymongo>=4.12,<4.16
+# redis==5.2.1  # Removed - OpenAI manages conversation state
+
+# HTTP Client
+httpx==0.28.1
+aiohttp==3.11.11
+
+# AWS S3 Compatible (for Cloudflare R2)
+boto3>=1.34.0
+aioboto3>=12.0.0
+
+# LangGraph
+langgraph>=1.0.5
+langchain-core>=1.2.5
+langchain-openai>=0.3.0
+langgraph-checkpoint-mongodb>=0.3.0
+
+# Utilities
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+tenacity==9.0.0
+geopy==2.4.1
+
+# Monitoring & Logging
+loguru==0.7.3
+
+# PDF Generation
+reportlab==4.2.5
+Pillow==11.0.0
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.2
