@@ -106,6 +106,9 @@ class AgentState(TypedDict):
     # Current classification
     classification: Literal["SAFE", "UNSAFE", "PENDING"]
     
+    # Intent for routing to specialized agents
+    intent: Optional[Literal["sales", "reverse_logistics"]]
+    
     # Escalation
     escalation: Optional[EscalationRequest]
     requires_human: bool

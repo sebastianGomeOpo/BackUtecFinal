@@ -555,8 +555,77 @@ async def get_delivery_slots() -> str:
 
 
 @tool
+async def select_delivery_slot(slot_number: int) -> str:
+    """
+    Selecciona un horario de entrega de la lista mostrada.
+    Usar cuando el cliente indica que numero de horario quiere.
+    Ejemplos de uso:
+    - "el 17" -> select_delivery_slot(slot_number=17)
+    - "quiero el horario 3" -> select_delivery_slot(slot_number=3)
+    - "el domingo 11/01 a las 12" -> buscar el numero correspondiente y usar select_delivery_slot
+    - "prefiero el 5" -> select_delivery_slot(slot_number=5)
+    
+    Args:
+        slot_number: Numero del horario seleccionado de la lista (1, 2, 3, etc.)
+    """
+    try:
+        db = MongoDB.get_database()
+        slots = await db.delivery_slots.find(
+            {"available": True, "$expr": {"$lt": ["$current_orders", "$max_orders"]}}
+        ).sort([("date", 1), ("time_start", 1)]).to_list(30)
+        
+        if not slots:
+            return json.dumps({"success": False, "error": "No hay horarios disponibles"})
+        
+        if slot_number < 1 or slot_number > len(slots):
+            return json.dumps({
+                "success": False, 
+                "error": f"Numero de horario invalido. Debe ser entre 1 y {len(slots)}"
+            })
+        
+        selected_slot = slots[slot_number - 1]
+        
+        # Store selected slot in context for later use
+        ctx = get_tool_context()
+        conversation_id = ctx["conversation_id"]
+        
+        # Save selection to database for this conversation
+        await db.pending_orders.update_one(
+            {"conversation_id": conversation_id},
+            {
+                "$set": {
+                    "selected_slot_index": slot_number,
+                    "selected_slot": {
+                        "id": str(selected_slot["_id"]),
+                        "date": selected_slot["date"],
+                        "day_name": selected_slot["day_name"],
+                        "time_start": selected_slot["time_start"],
+                        "time_end": selected_slot["time_end"],
+                        "label": selected_slot["label"]
+                    },
+                    "updated_at": datetime.utcnow()
+                }
+            },
+            upsert=True
+        )
+        
+        return json.dumps({
+            "success": True,
+            "message": f"Horario seleccionado: {selected_slot['day_name']} {selected_slot['date']} de {selected_slot['time_start']} a {selected_slot['time_end']}",
+            "selected_slot": {
+                "date": selected_slot["date"],
+                "day_name": selected_slot["day_name"],
+                "time": f"{selected_slot['time_start']} - {selected_slot['time_end']}",
+                "label": selected_slot["label"]
+            },
+            "next_step": "Ahora necesito los datos del cliente para completar la orden: nombre completo, tipo y numero de documento, telefono, email y direccion de entrega."
+        })
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@tool
 async def create_order(
-    delivery_slot_index: int,
     customer_name: str,
     customer_id_type: str,
     customer_id_number: str,
@@ -566,11 +635,11 @@ async def create_order(
     address_reference: str = ""
 ) -> str:
     """
-    Crea la orden final con todos los datos del cliente.
-    SOLO usar cuando tengas TODOS los datos requeridos del cliente.
+    Crea la orden final con los datos del cliente.
+    SOLO usar despues de que el cliente haya seleccionado un horario con select_delivery_slot
+    y haya proporcionado TODOS sus datos.
     
     Args:
-        delivery_slot_index: Numero del horario de entrega seleccionado (1, 2, 3...)
         customer_name: Nombre completo del cliente
         customer_id_type: Tipo de documento (DNI, RUC, CE, Pasaporte)
         customer_id_number: Numero de documento
@@ -580,6 +649,7 @@ async def create_order(
         address_reference: Referencia de la direccion (opcional)
     """
     import uuid
+    from bson import ObjectId
     # Generate unique order number first to avoid null key errors
     order_number = f"ORD-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
     
@@ -595,15 +665,16 @@ async def create_order(
         if not cart["items"]:
             return json.dumps({"success": False, "error": "El carrito esta vacio"})
         
-        slots = await db.delivery_slots.find(
-            {"available": True}
-        ).sort([("date", 1), ("time_start", 1)]).to_list(30)
+        # Get the previously selected delivery slot
+        pending_order = await db.pending_orders.find_one({"conversation_id": conversation_id})
+        if not pending_order or not pending_order.get("selected_slot"):
+            return json.dumps({
+                "success": False, 
+                "error": "No has seleccionado un horario de entrega. Por favor selecciona uno primero."
+            })
         
-        if delivery_slot_index < 1 or delivery_slot_index > len(slots):
-            return json.dumps({"success": False, "error": f"Horario invalido. Selecciona un numero entre 1 y {len(slots)}"})
-        
-        selected_slot = slots[delivery_slot_index - 1]
-        slot_id = selected_slot["_id"]
+        selected_slot = pending_order["selected_slot"]
+        slot_id = ObjectId(selected_slot["id"])
         
         order = {
             "order_number": order_number,
@@ -1205,6 +1276,7 @@ SALES_TOOLS = [
     get_cart,
     confirm_cart_before_checkout,
     get_delivery_slots,
+    select_delivery_slot,
     create_order,
     lookup_order,
     cancel_order,
@@ -1244,7 +1316,8 @@ def get_system_prompt(user_context: Dict, cart_summary: str) -> str:
 - get_cart: Ver carrito actual
 - confirm_cart_before_checkout: Mostrar resumen antes de pagar
 - get_delivery_slots: Ver horarios de entrega disponibles
-- create_order: Crear orden final (requiere todos los datos del cliente)
+- select_delivery_slot: Seleccionar horario de entrega (USAR cuando el cliente indica un numero de horario)
+- create_order: Crear orden final (SOLO despues de seleccionar horario y tener todos los datos del cliente)
 - lookup_order: Consultar pedido anterior (requiere numero + monto total)
 - cancel_order: Cancelar pedido (requiere numero + monto total)
 - escalate_to_human: Escalar a supervisor humano
@@ -1280,8 +1353,10 @@ USA search_products SOLO para preguntas exploratorias SIN intencion de compra in
 3. Cliente elige -> add_to_cart (reserva 5 min)
 4. Si quiere modificar -> update_cart_quantity o remove_product_from_cart
 5. Antes de checkout -> confirm_cart_before_checkout
-6. Cliente confirma -> get_delivery_slots
-7. Recopilar datos del cliente:
+6. Cliente confirma -> get_delivery_slots (muestra lista numerada de horarios)
+7. Cliente selecciona horario -> select_delivery_slot(slot_number=X)
+   IMPORTANTE: Cuando el cliente dice "el 17", "quiero el horario 3", "el domingo a las 12" (buscar el numero correspondiente), etc. -> USA select_delivery_slot
+8. Recopilar datos del cliente:
    - Nombre completo
    - Tipo documento (DNI, RUC, CE, Pasaporte)
    - Numero documento
@@ -1289,7 +1364,16 @@ USA search_products SOLO para preguntas exploratorias SIN intencion de compra in
    - Email
    - Direccion
    - Referencia (opcional)
-8. Crear orden -> create_order
+9. Crear orden -> create_order (ya tiene el horario guardado)
+
+**CRITICO - Seleccion de Horario:**
+Cuando el cliente indica un numero de horario de la lista mostrada, SIEMPRE usa select_delivery_slot:
+- "el 17" -> select_delivery_slot(slot_number=17)
+- "quiero el horario 3" -> select_delivery_slot(slot_number=3)
+- "prefiero el 5" -> select_delivery_slot(slot_number=5)
+- "el primero" -> select_delivery_slot(slot_number=1)
+- "el ultimo" -> select_delivery_slot(slot_number=25) (o el numero correspondiente)
+NO vuelvas a mostrar la lista de horarios si el cliente ya eligio uno.
 
 **Consulta de Pedidos:**
 - Para consultar un pedido: pedir numero de orden + monto total (seguridad)
@@ -1453,17 +1537,23 @@ async def sales_agent_node_v3(state: AgentState) -> AgentState:
             
             # Collect HTML from tool results
             html_parts = []
+            message_parts = []
             for tr in tool_results:
-                if isinstance(tr["result"], dict) and "html_table" in tr["result"]:
-                    html_parts.append(tr["result"]["html_table"])
-                elif isinstance(tr["result"], dict) and "html" in tr["result"]:
-                    html_parts.append(tr["result"]["html"])
+                if isinstance(tr["result"], dict):
+                    if "html_table" in tr["result"]:
+                        html_parts.append(tr["result"]["html_table"])
+                    elif "html" in tr["result"]:
+                        html_parts.append(tr["result"]["html"])
+                    elif "message" in tr["result"]:
+                        message_parts.append(tr["result"]["message"])
             
-            # Build final message: HTML table only, no LLM text (to avoid duplicates)
+            # Build final message
             if html_parts:
-                # Use only the HTML table, ignore LLM response completely
-                # The HTML table already has all the info and instructions
                 final_message = "\n\n".join(html_parts)
+            elif message_parts:
+                final_message = "\n".join(message_parts)
+                if llm_response:
+                    final_message = llm_response
             else:
                 final_message = llm_response
         else:

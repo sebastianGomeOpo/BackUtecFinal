@@ -11,14 +11,24 @@ from src.config import settings
 from .nodes.context_injector import context_injector_node
 from .nodes.supervisor import supervisor_node
 from .nodes.sales_agent_v3 import sales_agent_node_v3 as sales_agent_node
+from .nodes.reverse_logistics_agent import reverse_logistics_agent_node
 from .nodes.human_node import human_node, process_human_response
 from .nodes.memory_optimizer import memory_optimizer_node
 
 
 def route_after_supervisor(state: AgentState) -> str:
-    """Route based on supervisor classification"""
+    """
+    Route based on supervisor classification and intent detection.
+    Supervisor decides which specialized agent should handle the request.
+    """
     if state.get("requires_human") or state.get("classification") == "UNSAFE":
         return "human_node"
+    
+    # Check intent for routing to specialized agents
+    intent = state.get("intent", "sales")
+    if intent == "reverse_logistics":
+        return "reverse_logistics_agent"
+    
     return "sales_agent"
 
 
@@ -29,11 +39,20 @@ def route_after_sales_agent(state: AgentState) -> str:
     return "memory_optimizer"
 
 
+def route_after_reverse_logistics_agent(state: AgentState) -> str:
+    """Route based on reverse logistics agent decision"""
+    if state.get("requires_human"):
+        return "human_node"
+    return "memory_optimizer"
+
+
 def route_after_human_node(state: AgentState) -> str:
     """Route based on human decision"""
     next_node = state.get("next_node")
     if next_node == "sales_agent":
         return "sales_agent"
+    if next_node == "reverse_logistics_agent":
+        return "reverse_logistics_agent"
     return "memory_optimizer"
 
 
@@ -55,6 +74,7 @@ def create_sales_graph() -> StateGraph:
     graph.add_node("context_injector", context_injector_node)
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("sales_agent", sales_agent_node)
+    graph.add_node("reverse_logistics_agent", reverse_logistics_agent_node)
     graph.add_node("human_node", human_node)
     graph.add_node("memory_optimizer", memory_optimizer_node)
     
@@ -70,6 +90,7 @@ def create_sales_graph() -> StateGraph:
         route_after_supervisor,
         {
             "sales_agent": "sales_agent",
+            "reverse_logistics_agent": "reverse_logistics_agent",
             "human_node": "human_node"
         }
     )
@@ -84,12 +105,23 @@ def create_sales_graph() -> StateGraph:
         }
     )
     
+    # Conditional routing after reverse logistics agent
+    graph.add_conditional_edges(
+        "reverse_logistics_agent",
+        route_after_reverse_logistics_agent,
+        {
+            "human_node": "human_node",
+            "memory_optimizer": "memory_optimizer"
+        }
+    )
+    
     # Conditional routing after human node
     graph.add_conditional_edges(
         "human_node",
         route_after_human_node,
         {
             "sales_agent": "sales_agent",
+            "reverse_logistics_agent": "reverse_logistics_agent",
             "memory_optimizer": "memory_optimizer"
         }
     )

@@ -54,6 +54,36 @@ UNSAFE_PATTERNS = {
 }
 
 
+# Intent patterns for routing to specialized agents
+REVERSE_LOGISTICS_PATTERNS = [
+    "devolucion", "devolver", "devuelvo",
+    "cambio", "cambiar", "intercambio",
+    "reembolso", "reembolsar",
+    "return", "refund",
+    "no me sirve", "no funciona", "defectuoso",
+    "producto danado", "llego roto", "llego mal",
+    "quiero regresar", "quiero devolver",
+    "politica de devolucion", "politica de cambio",
+    "estado de mi devolucion", "estado del cambio",
+    "RET-", "EXC-"  # Return/Exchange IDs
+]
+
+
+def detect_intent(message: str) -> Literal["sales", "reverse_logistics"]:
+    """
+    Detect user intent to route to the appropriate agent.
+    
+    Returns: 'sales' or 'reverse_logistics'
+    """
+    message_lower = message.lower()
+    
+    for pattern in REVERSE_LOGISTICS_PATTERNS:
+        if pattern.lower() in message_lower:
+            return "reverse_logistics"
+    
+    return "sales"
+
+
 def classify_message(message: str) -> tuple[Literal["SAFE", "UNSAFE"], str, str]:
     """
     RF-SEC-01: Classify message as SAFE or UNSAFE
@@ -133,11 +163,14 @@ Si el mensaje es una consulta normal de ventas, es SAFE."""
 
 async def supervisor_node(state: AgentState) -> AgentState:
     """
-    RF-SEC-01 to RF-SEC-03: Supervisor Node
+    Supervisor Node - Central routing and security
     
-    - Analyzes last user message
-    - Classifies as SAFE or UNSAFE
-    - Routes to SalesAgent (SAFE) or HumanNode (UNSAFE)
+    Responsibilities:
+    1. Classify messages as SAFE or UNSAFE
+    2. Detect intent to route to specialized agents:
+       - Sales Agent: Product inquiries, purchases, orders
+       - Reverse Logistics Agent: Returns, exchanges, refunds
+    3. Route UNSAFE messages to Human Node for review
     """
     messages = state.get("messages", [])
     
@@ -232,13 +265,30 @@ async def supervisor_node(state: AgentState) -> AgentState:
             "reasoning_trace": [reasoning]
         }
     
-    # SAFE: Route to SalesAgent
+    # SAFE: Detect intent and route to appropriate agent
+    intent = detect_intent(last_message)
+    
+    # Add intent detection to reasoning
+    intent_reasoning: AgentReasoning = {
+        "agent": "Supervisor",
+        "action": "detect_intent",
+        "reasoning": f"Intent detectado: {intent}",
+        "timestamp": datetime.utcnow().isoformat(),
+        "result": {
+            "intent": intent,
+            "routed_to": "reverse_logistics_agent" if intent == "reverse_logistics" else "sales_agent"
+        }
+    }
+    
+    next_agent = "reverse_logistics_agent" if intent == "reverse_logistics" else "sales_agent"
+    
     return {
         **state,
         "classification": "SAFE",
+        "intent": intent,
         "escalation": None,
         "requires_human": False,
         "current_node": "supervisor",
-        "next_node": "sales_agent",
-        "reasoning_trace": [reasoning]
+        "next_node": next_agent,
+        "reasoning_trace": [reasoning, intent_reasoning]
     }
