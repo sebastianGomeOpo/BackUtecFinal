@@ -12,10 +12,10 @@ from ..database.mongodb import MongoDB
 class StockReservationService:
     """
     Manages temporary stock reservations for cart items.
-    Reservations expire after 5 minutes if not confirmed.
+    Reservations expire after 15 minutes if not confirmed.
     """
     
-    RESERVATION_TTL_MINUTES = 5
+    RESERVATION_TTL_MINUTES = 15
     
     def __init__(self):
         self._cleanup_task: Optional[asyncio.Task] = None

@@ -1,9 +1,10 @@
 """
 Follow-up Monitor Agent
 Monitors conversation inactivity and sends follow-up messages
-Max 3 follow-ups per conversation, 1 minute interval
+Random interval between 20-120 seconds
 """
 import asyncio
+import random
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -13,19 +14,29 @@ from ...database.mongodb import MongoDB
 class FollowUpMonitor:
     """
     Monitors conversations for inactivity and triggers follow-up messages.
-    - Triggers after 1 minute of user inactivity
-    - Maximum 3 follow-ups per conversation
+    - Triggers after random 20-120 seconds of user inactivity
+    - Progressive discount offers
     - Stops if user responds
     """
     
-    INACTIVITY_THRESHOLD_SECONDS = 60  # 1 minute
-    MAX_FOLLOWUPS = 3
+    INACTIVITY_MIN_SECONDS = 20
+    INACTIVITY_MAX_SECONDS = 120
+    MAX_FOLLOWUPS = 999  # Unlimited follow-ups
+    MAX_DISCOUNT_PERCENT = 20  # Maximum discount cap
     
     FOLLOWUP_MESSAGES = [
-        "¿Hay algo más en lo que pueda ayudarte? Estoy aquí para resolver cualquier duda sobre nuestros productos.",
-        "¿Te gustaría que te muestre más opciones o tienes alguna pregunta sobre los productos que vimos?",
-        "Si necesitas más tiempo para decidir, no hay problema. Recuerda que los productos en tu carrito están reservados por 5 minutos. ¿Puedo ayudarte en algo más?"
+        "Hola, sigo aqui para ayudarte. Si tienes alguna pregunta sobre los productos o necesitas una recomendacion, con gusto te asesoro.",
+        "Tengo una sorpresa para ti: si confirmas tu compra ahora, te aplico un **5% de descuento** automatico. Es mi forma de agradecerte por elegirnos.",
+        "Veo que aun estas pensando. Te cuento que puedo mejorar tu oferta a un **8% de descuento**. Es una oportunidad que no quiero que te pierdas.",
+        "Quiero que te lleves lo mejor. Por eso, te ofrezco un **10% de descuento** exclusivo solo para ti. Esta oferta es por tiempo limitado.",
+        "Se que a veces necesitamos pensarlo bien. Para ayudarte a decidir, te ofrezco **12% de descuento**. Es un precio especial que no encontraras en otro lado.",
+        "Esta es mi mejor oferta: **15% de descuento**. Realmente quiero que te lleves estos productos a un precio increible.",
+        "Voy a hacer algo especial por ti: **18% de descuento**. Es el maximo que puedo ofrecer y vale la pena aprovecharlo.",
+        "Mi oferta final y la mejor que tengo: **20% de descuento**. No puedo mejorar esto, pero estoy segura de que te encantara tu compra."
     ]
+    
+    # Discount percentages for each follow-up level (0=no discount, then progressive)
+    FOLLOWUP_DISCOUNT_LEVELS = [0, 5, 8, 10, 12, 15, 18, 20]
     
     def __init__(self):
         self._monitoring_tasks: Dict[str, asyncio.Task] = {}
@@ -92,7 +103,9 @@ class FollowUpMonitor:
         
         while True:
             try:
-                await asyncio.sleep(self.INACTIVITY_THRESHOLD_SECONDS)
+                # Random wait between 20-120 seconds
+                wait_time = random.randint(self.INACTIVITY_MIN_SECONDS, self.INACTIVITY_MAX_SECONDS)
+                await asyncio.sleep(wait_time)
                 
                 # Get conversation activity
                 activity = await db.conversation_activity.find_one({
@@ -108,10 +121,10 @@ class FollowUpMonitor:
                 if not last_user_message:
                     continue
                 
-                # Check if enough time has passed since last user message
+                # Check if enough time has passed since last user message (minimum threshold)
                 time_since_message = datetime.utcnow() - last_user_message
                 
-                if time_since_message.total_seconds() >= self.INACTIVITY_THRESHOLD_SECONDS:
+                if time_since_message.total_seconds() >= self.INACTIVITY_MIN_SECONDS:
                     # Check if we haven't exceeded max follow-ups
                     if followup_count < self.MAX_FOLLOWUPS:
                         # Send follow-up
@@ -139,19 +152,44 @@ class FollowUpMonitor:
                 await asyncio.sleep(10)
     
     async def _send_followup(self, conversation_id: str, followup_index: int):
-        """Send a follow-up message"""
-        message = self.FOLLOWUP_MESSAGES[followup_index % len(self.FOLLOWUP_MESSAGES)]
+        """Send a follow-up message with progressive discount offers"""
+        # Cap the index to the last message/discount level (max 20%)
+        capped_index = min(followup_index, len(self.FOLLOWUP_MESSAGES) - 1)
+        message = self.FOLLOWUP_MESSAGES[capped_index]
+        discount_percent = self.FOLLOWUP_DISCOUNT_LEVELS[min(capped_index, len(self.FOLLOWUP_DISCOUNT_LEVELS) - 1)]
         
-        # Log the follow-up
+        # If we've reached max discount, keep repeating the max offer
+        if followup_index >= len(self.FOLLOWUP_MESSAGES):
+            discount_percent = self.MAX_DISCOUNT_PERCENT
+            message = f"Sigo aqui para ayudarte. Recuerda que tienes un **{discount_percent}% de descuento** esperandote. ¿Procedemos con tu compra?"
+        
         db = self._get_db()
+        
+        # Log the follow-up with discount info
         await db.followup_logs.insert_one({
             "conversation_id": conversation_id,
             "message": message,
             "followup_number": followup_index + 1,
+            "discount_percent": discount_percent,
             "sent_at": datetime.utcnow()
         })
         
-        print(f"📤 Follow-up #{followup_index + 1} sent to {conversation_id}")
+        # Store pending discount offer for this conversation
+        if discount_percent > 0:
+            await db.pending_discounts.update_one(
+                {"conversation_id": conversation_id},
+                {
+                    "$set": {
+                        "discount_percent": discount_percent,
+                        "offered_at": datetime.utcnow(),
+                        "expires_at": datetime.utcnow() + timedelta(minutes=5),
+                        "applied": False
+                    }
+                },
+                upsert=True
+            )
+        
+        print(f"📤 Follow-up #{followup_index + 1} sent to {conversation_id} (discount: {discount_percent}%)")
         
         # Call the callback if registered
         if conversation_id in self._followup_callbacks:

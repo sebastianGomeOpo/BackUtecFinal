@@ -17,12 +17,6 @@ async def save_escalation(escalation: EscalationRequest) -> None:
     })
 
 
-async def get_escalation(escalation_id: str) -> Dict[str, Any]:
-    """Get escalation by ID"""
-    db = MongoDB.get_database()
-    return await db.escalations.find_one({"id": escalation_id})
-
-
 async def update_escalation(escalation_id: str, status: str, supervisor_response: str = None) -> None:
     """Update escalation status"""
     db = MongoDB.get_database()

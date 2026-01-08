@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     # Rate Limiting
     rate_limit_per_minute: int = 60
     
+    # Upstash Redis (Volatile Memory)
+    upstash_redis_rest_url: str = ""
+    upstash_redis_rest_token: str = ""
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

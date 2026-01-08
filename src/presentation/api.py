@@ -73,19 +73,38 @@ def create_app() -> FastAPI:
         description="Agente de ventas digital con IA",
         version="1.0.0",
         lifespan=lifespan,
-        root_path="/",  # For proper URL generation behind proxy
     )
     
-    # Configure CORS (must be before routes)
-    # Get allowed origins from environment variable
-    allowed_origins = settings.cors_origins_list
+    # Root endpoints (defined first)
+    @app.get("/")
+    async def root():
+        return {
+            "message": "BlackCombinator Sales Agent API",
+            "version": "1.0.0",
+            "status": "healthy"
+        }
     
-    # In development, allow all origins
+    @app.get("/health")
+    async def health_check_root():
+        return {
+            "status": "healthy",
+            "service": "Sales Agent API"
+        }
+    
+    # Include routers BEFORE middleware
+    app.include_router(health.router, prefix="/api", tags=["Health"])
+    app.include_router(agent.router, prefix="/api/agent", tags=["Agent"])
+    app.include_router(products.router, prefix="/api/products", tags=["Products"])
+    app.include_router(download.router, prefix="/api/download", tags=["Download"])
+    app.include_router(receipt.router, prefix="/api", tags=["Receipt"])
+    app.include_router(images.router, prefix="/api/images", tags=["Images"])
+    app.include_router(audio.router, prefix="/api/audio", tags=["Audio"])
+    app.include_router(tts.router, prefix="/api/tts", tags=["TTS"])
+    
+    # Configure CORS (after routes)
+    allowed_origins = settings.cors_origins_list
     if settings.app_env == "development":
         allowed_origins = ["*"]
-    
-    # Add proxy headers middleware first (order matters - last added = first executed)
-    app.add_middleware(ProxyHeadersMiddleware)
     
     app.add_middleware(
         CORSMiddleware,
@@ -96,44 +115,6 @@ def create_app() -> FastAPI:
         expose_headers=["*"],
         max_age=3600,
     )
-    
-    # Include routers
-    app.include_router(health.router, prefix="/api", tags=["Health"])
-    
-    # LangGraph Agent - Main
-    app.include_router(agent.router, prefix="/api/agent", tags=["Agent"])
-    
-    # Supporting routes
-    app.include_router(products.router, prefix="/api/products", tags=["Products"])
-    app.include_router(download.router, prefix="/api/download", tags=["Download"])
-    app.include_router(receipt.router, prefix="/api", tags=["Receipt"])
-    app.include_router(images.router, prefix="/api/images", tags=["Images"])
-    app.include_router(audio.router, prefix="/api/audio", tags=["Audio"])
-    app.include_router(tts.router, prefix="/api/tts", tags=["TTS"])
-    
-    @app.get("/")
-    async def root():
-        return {
-            "message": "BlackCombinator Sales Agent API",
-            "version": "1.0.0",
-            "status": "healthy"
-        }
-    
-    # Health check endpoint for App Runner (root path)
-    @app.get("/health")
-    async def health_check_root():
-        return {
-            "status": "healthy",
-            "service": "Sales Agent API"
-        }
-    
-    @app.get("/deprecated_root")
-    async def deprecated_root():
-        return {
-            "message": "Sales Agent API",
-            "version": "1.0.0",
-            "status": "running"
-        }
     
     return app
 

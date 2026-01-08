@@ -3,11 +3,11 @@ Sales Agent Node V3 - LLM Agnostic with LangChain Tools
 - Uses LangChain @tool decorator for LLM-agnostic tool definitions
 - Uses ChatOpenAI (can be swapped for any LangChain-compatible LLM)
 - Products displayed in HTML table with images
-- Stock validation with temporary reservations (5 min TTL)
+- Stock validation with temporary reservations (15 min TTL)
 - Full cart management with order confirmation
 """
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import re
 from langchain_core.tools import tool
@@ -20,6 +20,8 @@ from ...repositories.product_repository import MongoProductRepository
 from ...services.stock_reservation import get_stock_service
 from ...services.cloudflare_r2 import get_r2_service
 from ...database.mongodb import MongoDB
+from .memory_optimizer import get_memory_state
+from ...services.upstash_redis import get_redis
 
 
 # Session product mapping (index/SKU -> UUID) - NOT a cache, needed for "producto 1" resolution
@@ -64,8 +66,73 @@ def _save_product_mapping(conversation_id: str, products: List[Dict]):
     _session_product_map[conversation_id] = mapping
 
 
+def _calculate_similarity(text1: str, text2: str) -> float:
+    """Calculate similarity score between two texts using word overlap.
+    Returns a score between 0 and 1.
+    """
+    # Normalize texts
+    words1 = set(text1.lower().split())
+    words2 = set(text2.lower().split())
+    
+    # Remove common stop words
+    stop_words = {'de', 'con', 'y', 'el', 'la', 'los', 'las', 'un', 'una', 'para', 'en', 'del'}
+    words1 = words1 - stop_words
+    words2 = words2 - stop_words
+    
+    if not words1 or not words2:
+        return 0.0
+    
+    # Calculate Jaccard similarity + bonus for substring matches
+    intersection = words1 & words2
+    union = words1 | words2
+    jaccard = len(intersection) / len(union) if union else 0
+    
+    # Bonus for substring containment
+    text1_lower = text1.lower()
+    text2_lower = text2.lower()
+    substring_bonus = 0.3 if text1_lower in text2_lower or text2_lower in text1_lower else 0
+    
+    # Bonus for matching key words (first significant word)
+    significant_words1 = [w for w in text1.lower().split() if len(w) > 3 and w not in stop_words]
+    significant_words2 = [w for w in text2.lower().split() if len(w) > 3 and w not in stop_words]
+    
+    keyword_bonus = 0
+    for w1 in significant_words1:
+        for w2 in significant_words2:
+            if w1 in w2 or w2 in w1:
+                keyword_bonus = 0.4
+                break
+    
+    return min(1.0, jaccard + substring_bonus + keyword_bonus)
+
+
+def _find_best_match(identifier: str, products: List[Dict], threshold: float = 0.3) -> Optional[Dict]:
+    """Find the best matching product from a list using similarity scoring.
+    Returns the product dict or None if no good match found.
+    """
+    if not products or not identifier:
+        return None
+    
+    best_match = None
+    best_score = 0
+    
+    for product in products:
+        product_name = product.get("name", "")
+        score = _calculate_similarity(identifier, product_name)
+        
+        if score > best_score and score >= threshold:
+            best_score = score
+            best_match = product
+    
+    return best_match
+
+
 async def _resolve_product_id(conversation_id: str, identifier: str) -> str:
-    """Resolve product by index, SKU, name, or UUID"""
+    """Resolve product by index, SKU, or name similarity from session mapping.
+    
+    Uses fuzzy matching to find products even with partial or misspelled names.
+    Only searches within products shown to the user in the current conversation.
+    """
     global _session_product_map
     identifier = str(identifier).strip()
     
@@ -76,158 +143,181 @@ async def _resolve_product_id(conversation_id: str, identifier: str) -> str:
     
     mapping = _session_product_map.get(conversation_id, {})
     
-    # Try to parse as index (1, 2, 3...)
+    # If no mapping exists, return None to indicate product not found
+    if not mapping:
+        return None
+    
+    # Try to parse as index (1, 2, 3...) - MOST COMMON CASE
     try:
         index = int(identifier)
         if index in mapping.get("by_index", {}):
             return mapping["by_index"][index]
+        # Index out of range
+        return None
     except ValueError:
         pass
     
-    # Try SKU (case insensitive)
+    # Try exact SKU match (case insensitive)
     sku_upper = identifier.upper()
     if sku_upper in mapping.get("by_sku", {}):
         return mapping["by_sku"][sku_upper]
     
-    # Try partial SKU match
+    # Try partial SKU match only within session products
     for sku, pid in mapping.get("by_sku", {}).items():
         if sku_upper in sku or sku in sku_upper:
             return pid
     
-    # Try name (case insensitive, partial match)
+    # Try exact name match (case insensitive)
     name_lower = identifier.lower()
-    for name, pid in mapping.get("by_name", {}).items():
-        if name_lower in name or name in name_lower:
-            return pid
+    if name_lower in mapping.get("by_name", {}):
+        return mapping["by_name"][name_lower]
     
-    # If not found in mapping, try to find in MongoDB by SKU or name
-    db = MongoDB.get_database()
+    # Use similarity matching for partial/fuzzy name matches
+    products = mapping.get("products", [])
+    best_match = _find_best_match(identifier, products, threshold=0.3)
     
-    # Try exact SKU match first
-    product = await db.products.find_one({"sku": {"$regex": f"^{identifier}$", "$options": "i"}})
-    if product:
-        return product["id"]
+    if best_match:
+        return best_match.get("id")
     
-    # Try partial SKU match
-    product = await db.products.find_one({"sku": {"$regex": identifier, "$options": "i"}})
-    if product:
-        return product["id"]
-    
-    # Try name match with regex
-    product = await db.products.find_one({"name": {"$regex": identifier, "$options": "i"}})
-    if product:
-        return product["id"]
-    
-    # Try splitting words and matching any
-    words = identifier.lower().split()
-    if len(words) > 1:
-        for word in words:
-            if len(word) > 3:  # Skip short words
-                product = await db.products.find_one({"name": {"$regex": word, "$options": "i"}})
-                if product:
-                    return product["id"]
-    
-    # Last resort: use Pinecone semantic search
-    try:
-        from ...vectorstore.pinecone_store import PineconeStore
-        vectorstore = PineconeStore()
-        results = await vectorstore.search_products(identifier, top_k=1)
-        if results and len(results) > 0:
-            return results[0].get("id", identifier)
-    except Exception:
-        pass
-    
-    return identifier
+    # If not found in session mapping, return None
+    return None
 
 
 def _generate_products_table(products: List[Dict]) -> str:
-    """Generate HTML table for products with SKU"""
+    """Generate HTML cards for products with add buttons"""
     if not products:
         return "<p>No hay productos disponibles.</p>"
     
-    rows = []
+    cards = []
     for p in products:
-        stock_badge = f'<span style="color:green;">{p["stock"]} disp.</span>' if p["available"] else '<span style="color:red;">Sin stock</span>'
-        image_html = f'<img src="{p["image_url"]}" alt="{p["name"]}" style="width:50px;height:50px;object-fit:cover;border-radius:4px;">' if p["image_url"] else '<span style="color:#999;">-</span>'
+        stock_badge = f'<span style="color:#059669;font-size:11px;">{p["stock"]} disponibles</span>' if p["available"] else '<span style="color:#dc2626;font-size:11px;">Sin stock</span>'
+        image_html = f'<img src="{p["image_url"]}" alt="{p["name"]}" style="width:80px;height:80px;object-fit:cover;border-radius:8px;">' if p["image_url"] else '<div style="width:80px;height:80px;background:#f3f4f6;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#9ca3af;">Sin img</div>'
         
-        row = f'<tr style="border-bottom:1px solid #eee;"><td style="padding:8px;text-align:center;font-weight:bold;color:#4F46E5;">{p["index"]}</td><td style="padding:8px;text-align:center;">{image_html}</td><td style="padding:8px;"><strong>{p["name"]}</strong><br/><small style="color:#666;">{p["category"]}</small><br/><code style="font-size:10px;background:#f0f0f0;padding:2px 4px;border-radius:3px;">{p["sku"]}</code></td><td style="padding:8px;text-align:right;font-weight:bold;color:#059669;">${p["price"]:,.2f}</td><td style="padding:8px;text-align:center;">{stock_badge}</td></tr>'
-        rows.append(row)
+        card = f'''
+        <div class="product-card" data-index="{p["index"]}" data-name="{p["name"]}" style="display:flex;gap:12px;padding:12px;background:white;border-radius:12px;border:1px solid #e5e7eb;margin-bottom:10px;transition:all 0.2s;cursor:pointer;" onmouseover="this.style.borderColor='#4F46E5';this.style.boxShadow='0 4px 12px rgba(79,70,229,0.15)'" onmouseout="this.style.borderColor='#e5e7eb';this.style.boxShadow='none'">
+            <div style="flex-shrink:0;">{image_html}</div>
+            <div style="flex:1;min-width:0;">
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+                    <span style="background:#4F46E5;color:white;font-size:11px;font-weight:bold;padding:2px 8px;border-radius:10px;">#{p["index"]}</span>
+                    <span style="font-size:10px;color:#6b7280;background:#f3f4f6;padding:2px 6px;border-radius:4px;">{p["category"]}</span>
+                </div>
+                <div style="font-weight:600;color:#1f2937;font-size:14px;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{p["name"]}</div>
+                <div style="font-size:10px;color:#9ca3af;margin-bottom:6px;">SKU: {p["sku"]}</div>
+                <div style="display:flex;align-items:center;justify-content:space-between;">
+                    <div>
+                        <span style="font-size:18px;font-weight:bold;color:#059669;">${p["price"]:,.2f}</span>
+                        <div>{stock_badge}</div>
+                    </div>
+                    <button class="add-btn" data-index="{p["index"]}" style="background:#4F46E5;color:white;border:none;padding:8px 16px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:4px;transition:background 0.2s;" onmouseover="this.style.background='#4338ca'" onmouseout="this.style.background='#4F46E5'">
+                        <span style="font-size:16px;">+</span> Agregar
+                    </button>
+                </div>
+            </div>
+        </div>'''
+        cards.append(card)
     
-    tbody_content = ''.join(rows)
-    
-    html = f'<table style="width:100%;border-collapse:collapse;margin:10px 0;font-size:14px;"><thead><tr style="background:#4F46E5;color:white;"><th style="padding:10px;text-align:center;border-radius:8px 0 0 0;">#</th><th style="padding:10px;text-align:center;">Imagen</th><th style="padding:10px;text-align:left;">Producto / SKU</th><th style="padding:10px;text-align:right;">Precio</th><th style="padding:10px;text-align:center;border-radius:0 8px 0 0;">Stock</th></tr></thead><tbody>{tbody_content}</tbody></table><p style="font-size:12px;color:#666;margin-top:8px;">Puedes agregar productos indicando el <strong>#</strong>, <strong>SKU</strong> o <strong>nombre</strong>. Ej: "Quiero 2 del producto 1" o "Agrega el ESP-CIR-ORO-80"</p>'
+    html = f'<div style="margin:10px 0;">{"".join(cards)}</div>'
     
     return html
 
 
 def _generate_cart_html(cart: Dict) -> str:
-    """Generate HTML for cart display"""
-    rows = []
+    """Generate HTML for cart display with action buttons"""
+    items_html = []
     for item in cart["items"]:
-        rows.append(f"""
-        <tr>
-            <td>{item["product_name"]}</td>
-            <td style="text-align:center;">{item["quantity"]}</td>
-            <td style="text-align:right;">${item["price"]:,.2f}</td>
-            <td style="text-align:right;font-weight:bold;">${item["subtotal"]:,.2f}</td>
-        </tr>
-        """)
+        items_html.append(f'''
+        <div class="cart-item" data-product-id="{item.get("product_id", "")}" data-product-name="{item["product_name"]}" style="display:flex;align-items:center;gap:12px;padding:12px;background:white;border-radius:10px;margin-bottom:8px;border:1px solid #e5e7eb;">
+            <div style="flex:1;">
+                <div style="font-weight:600;color:#1f2937;font-size:13px;">{item["product_name"]}</div>
+                <div style="font-size:12px;color:#6b7280;">${item["price"]:,.2f} c/u</div>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;">
+                <button class="qty-btn minus-btn" data-product="{item["product_name"]}" style="width:28px;height:28px;border-radius:6px;border:1px solid #d1d5db;background:white;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;" onmouseover="this.style.background='#f3f4f6'" onmouseout="this.style.background='white'">-</button>
+                <span style="min-width:24px;text-align:center;font-weight:600;">{item["quantity"]}</span>
+                <button class="qty-btn plus-btn" data-product="{item["product_name"]}" style="width:28px;height:28px;border-radius:6px;border:1px solid #d1d5db;background:white;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;" onmouseover="this.style.background='#f3f4f6'" onmouseout="this.style.background='white'">+</button>
+            </div>
+            <div style="text-align:right;min-width:70px;">
+                <div style="font-weight:bold;color:#059669;">${item["subtotal"]:,.2f}</div>
+            </div>
+            <button class="remove-btn" data-product="{item["product_name"]}" style="width:28px;height:28px;border-radius:6px;border:none;background:#fee2e2;color:#dc2626;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;" onmouseover="this.style.background='#fecaca'" onmouseout="this.style.background='#fee2e2'" title="Eliminar">✕</button>
+        </div>''')
     
-    return f"""
-    <table style="width:100%;border-collapse:collapse;margin:10px 0;">
-        <thead>
-            <tr style="background:#f5f5f5;border-bottom:2px solid #ddd;">
-                <th style="padding:8px;text-align:left;">Producto</th>
-                <th style="padding:8px;text-align:center;">Cant.</th>
-                <th style="padding:8px;text-align:right;">Precio</th>
-                <th style="padding:8px;text-align:right;">Subtotal</th>
-            </tr>
-        </thead>
-        <tbody>
-            {''.join(rows)}
-        </tbody>
-        <tfoot>
-            <tr style="border-top:2px solid #333;font-weight:bold;">
-                <td colspan="3" style="padding:8px;text-align:right;">TOTAL:</td>
-                <td style="padding:8px;text-align:right;">${cart["total"]:,.2f}</td>
-            </tr>
-        </tfoot>
-    </table>
-    <p style="font-size:12px;color:#666;">Los productos estan reservados por 5 minutos. Confirma tu orden para completar la compra.</p>
-    """
+    return f'''
+    <div style="margin:10px 0;padding:15px;background:#f9fafb;border-radius:12px;border:1px solid #e5e7eb;">
+        <div style="font-weight:600;color:#1f2937;margin-bottom:12px;font-size:14px;">Tu Carrito ({len(cart["items"])} productos)</div>
+        {"".join(items_html)}
+        <div style="display:flex;justify-content:space-between;align-items:center;padding-top:12px;border-top:2px solid #e5e7eb;margin-top:8px;">
+            <span style="font-weight:600;color:#374151;">TOTAL:</span>
+            <span style="font-size:20px;font-weight:bold;color:#059669;">${cart["total"]:,.2f}</span>
+        </div>
+        <p style="font-size:11px;color:#6b7280;margin-top:8px;">Los productos estan reservados por 15 minutos. Confirma tu orden para completar la compra.</p>
+    </div>
+    '''
 
 
 def _generate_delivery_slots_html(slots_by_date: List[Dict]) -> str:
-    """Generate HTML for delivery slots selection"""
-    rows = []
-    slot_index = 1
-    for day in slots_by_date:
+    """Generate HTML for delivery slots selection - Matrix format (days x hours)"""
+    # Define time slots and row codes
+    time_slots = ["09:00 - 12:00", "12:00 - 15:00", "15:00 - 18:00", "18:00 - 21:00"]
+    row_codes = ["A", "B", "C", "D", "E", "F", "G"]  # Up to 7 days
+    
+    # Build matrix: day -> {time_slot -> code}
+    slot_matrix = {}
+    code_to_slot = {}  # For reverse lookup
+    
+    for day_idx, day in enumerate(slots_by_date[:7]):  # Max 7 days
+        row_code = row_codes[day_idx]
+        day_key = f"{day['day_name'][:3]} {day['date'].split('-')[2]}/{day['date'].split('-')[1]}"
+        slot_matrix[day_key] = {"day_name": day["day_name"], "date": day["date"], "slots": {}}
+        
         for slot in day["slots"]:
-            rows.append(f"""
-            <tr style="border-bottom:1px solid #eee;">
-                <td style="padding:8px;text-align:center;font-weight:bold;color:#4F46E5;">{slot_index}</td>
-                <td style="padding:8px;">{day["day_name"]} {day["date"].split('-')[2]}/{day["date"].split('-')[1]}</td>
-                <td style="padding:8px;">{slot["time"]}</td>
-            </tr>
-            """)
-            slot_index += 1
+            time_range = slot["time"]
+            # Find column index
+            col_idx = -1
+            for i, ts in enumerate(time_slots):
+                if ts == time_range:
+                    col_idx = i + 1
+                    break
+            if col_idx > 0:
+                code = f"{row_code}{col_idx}"
+                slot_matrix[day_key]["slots"][time_range] = code
+                code_to_slot[code] = {"date": day["date"], "time": time_range, "day_name": day["day_name"]}
+    
+    # Generate HTML table
+    rows_html = []
+    for day_idx, (day_key, day_data) in enumerate(slot_matrix.items()):
+        row_code = row_codes[day_idx]
+        cells = [f'<td style="padding:8px;font-weight:bold;background:#f8fafc;">{day_key}</td>']
+        
+        for i, ts in enumerate(time_slots):
+            code = day_data["slots"].get(ts)
+            if code:
+                cells.append(f'<td style="padding:8px;text-align:center;"><span style="background:#4F46E5;color:white;padding:4px 8px;border-radius:4px;font-weight:bold;font-size:12px;">{code}</span></td>')
+            else:
+                cells.append('<td style="padding:8px;text-align:center;color:#ccc;">-</td>')
+        
+        rows_html.append(f'<tr style="border-bottom:1px solid #eee;">{"".join(cells)}</tr>')
     
     return f"""
     <div style="margin:10px 0;">
-        <h4 style="color:#4F46E5;margin-bottom:10px;">Horarios de Entrega Disponibles</h4>
-        <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        <h4 style="color:#4F46E5;margin-bottom:10px;">Selecciona tu Horario de Entrega</h4>
+        <table style="width:100%;border-collapse:collapse;font-size:13px;border:1px solid #e5e7eb;">
             <thead>
                 <tr style="background:#4F46E5;color:white;">
-                    <th style="padding:10px;text-align:center;">#</th>
-                    <th style="padding:10px;text-align:left;">Fecha</th>
-                    <th style="padding:10px;text-align:left;">Horario</th>
+                    <th style="padding:10px;text-align:left;">Dia</th>
+                    <th style="padding:10px;text-align:center;">Manana<br><span style="font-size:10px;font-weight:normal;">09-12h</span></th>
+                    <th style="padding:10px;text-align:center;">Mediodia<br><span style="font-size:10px;font-weight:normal;">12-15h</span></th>
+                    <th style="padding:10px;text-align:center;">Tarde<br><span style="font-size:10px;font-weight:normal;">15-18h</span></th>
+                    <th style="padding:10px;text-align:center;">Noche<br><span style="font-size:10px;font-weight:normal;">18-21h</span></th>
                 </tr>
             </thead>
             <tbody>
-                {''.join(rows)}
+                {''.join(rows_html)}
             </tbody>
         </table>
-        <p style="font-size:12px;color:#666;margin-top:8px;">Indica el numero del horario que prefieres. Ej: "Quiero el horario 3"</p>
+        <p style="font-size:12px;color:#666;margin-top:10px;background:#f0f9ff;padding:8px;border-radius:4px;">
+            <strong>Indica el codigo del horario.</strong> Ej: "A2" = {list(slot_matrix.keys())[0] if slot_matrix else 'Primer dia'} de 12-15h
+        </p>
     </div>
     """
 
@@ -410,11 +500,11 @@ async def check_stock(product_id: str) -> str:
 @tool
 async def add_to_cart(product_id: str, quantity: int = 1) -> str:
     """
-    Agrega producto al carrito con reserva temporal de 5 minutos.
-    Acepta: numero de tabla (#), SKU o nombre del producto.
+    Agrega producto al carrito con reserva temporal de 15 minutos.
+    IMPORTANTE: Solo acepta el numero de la tabla (#1, #2, etc.) o el SKU exacto del producto mostrado.
     
     Args:
-        product_id: Identificador del producto (numero, SKU o nombre)
+        product_id: Numero de la tabla (1, 2, 3...) o SKU exacto del producto
         quantity: Cantidad a agregar (default: 1)
     """
     try:
@@ -425,6 +515,28 @@ async def add_to_cart(product_id: str, quantity: int = 1) -> str:
         stock_service = get_stock_service()
         
         resolved_id = await _resolve_product_id(conversation_id, product_id)
+        
+        # If product not found in session, return helpful error
+        if resolved_id is None:
+            # Get available products from session to show user
+            mapping = _session_product_map.get(conversation_id, {})
+            available_products = mapping.get("products", [])
+            
+            if not available_products:
+                return json.dumps({
+                    "success": False,
+                    "error": f"No encontre el producto '{product_id}'. Primero busca productos con search_products para ver las opciones disponibles.",
+                    "suggestion": "Usa search_products para buscar el producto que el cliente quiere."
+                })
+            
+            # Build list of available options
+            options = [f"#{p['index']} - {p['name']} (SKU: {p['sku']})" for p in available_products[:5]]
+            return json.dumps({
+                "success": False,
+                "error": f"No encontre el producto '{product_id}' en los resultados mostrados.",
+                "available_products": options,
+                "suggestion": "Pide al cliente que indique el numero (#) o SKU exacto de la tabla mostrada."
+            })
         
         result = await stock_service.reserve_stock(
             conversation_id=conversation_id,
@@ -446,7 +558,7 @@ async def add_to_cart(product_id: str, quantity: int = 1) -> str:
             "reserved_until": result.get("expires_at"),
             "cart_total": cart["total"],
             "cart_items": cart["item_count"],
-            "message": f"Agregado: {result.get('product_name')} x{quantity}. Reservado por 5 minutos."
+            "message": f"Agregado: {result.get('product_name')} x{quantity}. Reservado por 15 minutos."
         })
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)})
@@ -555,18 +667,20 @@ async def get_delivery_slots() -> str:
 
 
 @tool
-async def select_delivery_slot(slot_number: int) -> str:
+async def select_delivery_slot(slot_code: str) -> str:
     """
-    Selecciona un horario de entrega de la lista mostrada.
-    Usar cuando el cliente indica que numero de horario quiere.
+    Selecciona un horario de entrega usando el codigo de la tabla (A1, B2, C3, etc.).
+    La tabla muestra dias como filas (A=primer dia, B=segundo, etc.) y horas como columnas (1=09-12h, 2=12-15h, 3=15-18h, 4=18-21h).
+    
     Ejemplos de uso:
-    - "el 17" -> select_delivery_slot(slot_number=17)
-    - "quiero el horario 3" -> select_delivery_slot(slot_number=3)
-    - "el domingo 11/01 a las 12" -> buscar el numero correspondiente y usar select_delivery_slot
-    - "prefiero el 5" -> select_delivery_slot(slot_number=5)
+    - "A2" -> select_delivery_slot(slot_code="A2") = Primer dia, 12-15h
+    - "B1" -> select_delivery_slot(slot_code="B1") = Segundo dia, 09-12h
+    - "C4" -> select_delivery_slot(slot_code="C4") = Tercer dia, 18-21h
+    - "quiero el A3" -> select_delivery_slot(slot_code="A3")
+    - "el B2 por favor" -> select_delivery_slot(slot_code="B2")
     
     Args:
-        slot_number: Numero del horario seleccionado de la lista (1, 2, 3, etc.)
+        slot_code: Codigo del horario (A1, A2, B1, B2, etc.)
     """
     try:
         db = MongoDB.get_database()
@@ -577,24 +691,67 @@ async def select_delivery_slot(slot_number: int) -> str:
         if not slots:
             return json.dumps({"success": False, "error": "No hay horarios disponibles"})
         
-        if slot_number < 1 or slot_number > len(slots):
+        # Parse the code (e.g., "A2" -> row=0, col=2)
+        slot_code = slot_code.upper().strip()
+        
+        # Validate format: must be letter + number (A1, B2, etc.)
+        import re
+        if not re.match(r'^[A-G][1-4]$', slot_code):
             return json.dumps({
                 "success": False, 
-                "error": f"Numero de horario invalido. Debe ser entre 1 y {len(slots)}"
+                "error": f"El codigo '{slot_code}' no es valido. Debes seleccionar un codigo de la tabla como A1, B2, C3, etc. La letra indica el dia (A-G) y el numero la hora (1=09-12h, 2=12-15h, 3=15-18h, 4=18-21h). Por favor revisa la tabla y dime el codigo que prefieres."
             })
         
-        selected_slot = slots[slot_number - 1]
+        row_letter = slot_code[0]
+        col_number = slot_code[1:]
         
-        # Store selected slot in context for later use
+        row_codes = ["A", "B", "C", "D", "E", "F", "G"]
+        time_slots = ["09:00", "12:00", "15:00", "18:00"]
+        
+        if row_letter not in row_codes:
+            return json.dumps({"success": False, "error": f"Letra de dia invalida. Usa A-G"})
+        
+        try:
+            col_idx = int(col_number) - 1
+            if col_idx < 0 or col_idx > 3:
+                return json.dumps({"success": False, "error": "Numero de hora invalido. Usa 1-4"})
+        except:
+            return json.dumps({"success": False, "error": "Codigo invalido. Usa formato como A1, B2, C3"})
+        
+        row_idx = row_codes.index(row_letter)
+        target_time = time_slots[col_idx]
+        
+        # Group slots by date
+        slots_by_date = {}
+        for slot in slots:
+            date = slot["date"]
+            if date not in slots_by_date:
+                slots_by_date[date] = []
+            slots_by_date[date].append(slot)
+        
+        dates = sorted(slots_by_date.keys())
+        if row_idx >= len(dates):
+            return json.dumps({"success": False, "error": f"Dia no disponible. Solo hay {len(dates)} dias disponibles"})
+        
+        target_date = dates[row_idx]
+        selected_slot = None
+        
+        for slot in slots_by_date[target_date]:
+            if slot["time_start"] == target_time:
+                selected_slot = slot
+                break
+        
+        if not selected_slot:
+            return json.dumps({"success": False, "error": f"Horario {slot_code} no disponible. Elige otro de la tabla"})
+        
         ctx = get_tool_context()
         conversation_id = ctx["conversation_id"]
         
-        # Save selection to database for this conversation
         await db.pending_orders.update_one(
             {"conversation_id": conversation_id},
             {
                 "$set": {
-                    "selected_slot_index": slot_number,
+                    "selected_slot_code": slot_code,
                     "selected_slot": {
                         "id": str(selected_slot["_id"]),
                         "date": selected_slot["date"],
@@ -611,8 +768,9 @@ async def select_delivery_slot(slot_number: int) -> str:
         
         return json.dumps({
             "success": True,
-            "message": f"Horario seleccionado: {selected_slot['day_name']} {selected_slot['date']} de {selected_slot['time_start']} a {selected_slot['time_end']}",
+            "message": f"Horario {slot_code} seleccionado: {selected_slot['day_name']} {selected_slot['date'].split('-')[2]}/{selected_slot['date'].split('-')[1]} de {selected_slot['time_start']} a {selected_slot['time_end']}",
             "selected_slot": {
+                "code": slot_code,
                 "date": selected_slot["date"],
                 "day_name": selected_slot["day_name"],
                 "time": f"{selected_slot['time_start']} - {selected_slot['time_end']}",
@@ -865,6 +1023,750 @@ Responde SOLO con el resumen, sin titulos ni formato."""
         return f"Cliente escalado. Motivo: {reason}"
 
 
+# ============================================================================
+# BUDGET & COUPON TOOLS
+# ============================================================================
+
+@tool
+async def create_budget_proposal(budget: float, room_type: str = "general") -> str:
+    """
+    Crea una propuesta de productos optimizada para un presupuesto dado.
+    Usar cuando el cliente indica un presupuesto maximo y quiere recomendaciones.
+    
+    Args:
+        budget: Presupuesto maximo en dolares
+        room_type: Tipo de ambiente (general, sala, dormitorio, cocina, bano, comedor)
+    """
+    try:
+        ctx = get_tool_context()
+        conversation_id = ctx["conversation_id"]
+        
+        room_essentials = {
+            "general": ["cama", "sofa", "mesa", "silla", "lampara", "espejo"],
+            "sala": ["sofa", "mesa centro", "lampara", "estante"],
+            "dormitorio": ["cama", "mesita noche", "lampara", "espejo"],
+            "cocina": ["mesa", "silla", "estante"],
+            "bano": ["espejo", "organizador"],
+            "comedor": ["mesa comedor", "silla", "lampara"]
+        }
+        
+        search_terms = room_essentials.get(room_type.lower(), room_essentials["general"])
+        
+        all_products = []
+        pinecone_store = PineconeStore()
+        for term in search_terms:
+            results = await pinecone_store.search_products(term, top_k=5)
+            for p in results:
+                if p.get("stock", 0) > 0 and p.get("price", 0) > 0:
+                    all_products.append(p)
+        
+        seen_ids = set()
+        unique_products = []
+        for p in all_products:
+            pid = p.get("product_id") or p.get("id")
+            if pid and pid not in seen_ids:
+                seen_ids.add(pid)
+                unique_products.append(p)
+        
+        unique_products.sort(key=lambda x: x.get("price", 0))
+        
+        proposal = []
+        total = 0
+        remaining = budget
+        categories_covered = set()
+        
+        for product in unique_products:
+            price = product.get("price", 0)
+            category = product.get("category", "").lower()
+            if price <= remaining and category not in categories_covered:
+                proposal.append({
+                    "product_id": product.get("product_id") or product.get("id"),
+                    "name": product.get("name", ""),
+                    "category": product.get("category", ""),
+                    "price": price,
+                    "sku": product.get("sku", ""),
+                    "stock": product.get("stock", 0)
+                })
+                total += price
+                remaining -= price
+                categories_covered.add(category)
+        
+        for product in unique_products:
+            price = product.get("price", 0)
+            pid = product.get("product_id") or product.get("id")
+            if any(p["product_id"] == pid for p in proposal):
+                continue
+            if price <= remaining and len(proposal) < 10:
+                proposal.append({
+                    "product_id": pid,
+                    "name": product.get("name", ""),
+                    "category": product.get("category", ""),
+                    "price": price,
+                    "sku": product.get("sku", ""),
+                    "stock": product.get("stock", 0)
+                })
+                total += price
+                remaining -= price
+        
+        if not proposal:
+            return json.dumps({"success": False, "error": f"No encontre productos dentro de tu presupuesto de ${budget:,.2f}"})
+        
+        # Build proper session mapping with by_index, by_sku, by_name structures
+        mapping = {
+            "by_index": {},
+            "by_sku": {},
+            "by_name": {},
+            "products": []
+        }
+        for idx, p in enumerate(proposal, 1):
+            mapping["by_index"][str(idx)] = p["product_id"]
+            mapping["by_sku"][p["sku"].upper()] = p["product_id"]
+            mapping["by_name"][p["name"].lower()] = p["product_id"]
+            mapping["products"].append({
+                "index": idx,
+                "name": p["name"],
+                "sku": p["sku"],
+                "product_id": p["product_id"]
+            })
+        
+        # Save to both memory and Redis for persistence
+        _session_product_map[conversation_id] = mapping
+        try:
+            redis = get_redis()
+            await redis.set_product_mapping(conversation_id, mapping)
+            print(f"[PRODUCTS] Saved {len(mapping['products'])} products to Redis for {conversation_id}")
+        except Exception as e:
+            print(f"[PRODUCTS] Failed to save to Redis: {e}")
+        
+        r2_service = get_r2_service()
+        cards = []
+        for idx, p in enumerate(proposal, 1):
+            try:
+                image_key = f"products/{p['product_id']}.jpg"
+                image_url = r2_service.get_signed_url(image_key) if r2_service else ""
+            except:
+                image_url = ""
+            img_html = f'<img src="{image_url}" style="width:60px;height:60px;object-fit:cover;border-radius:8px;">' if image_url else '<div style="width:60px;height:60px;background:#e5e7eb;border-radius:8px;"></div>'
+            cards.append(f'''
+            <div class="product-card" data-index="{idx}" style="display:flex;gap:10px;padding:10px;background:white;border-radius:10px;border:1px solid #e5e7eb;margin-bottom:8px;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.borderColor='#4F46E5'" onmouseout="this.style.borderColor='#e5e7eb'">
+                <div style="flex-shrink:0;">{img_html}</div>
+                <div style="flex:1;min-width:0;">
+                    <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;">
+                        <span style="background:#4F46E5;color:white;font-size:10px;font-weight:bold;padding:2px 6px;border-radius:8px;">#{idx}</span>
+                        <span style="font-size:9px;color:#6b7280;background:#f3f4f6;padding:2px 4px;border-radius:3px;">{p["category"]}</span>
+                    </div>
+                    <div style="font-weight:600;color:#1f2937;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{p["name"]}</div>
+                    <div style="font-size:16px;font-weight:bold;color:#059669;">${p["price"]:,.2f}</div>
+                </div>
+                <button class="add-btn" data-index="{idx}" style="align-self:center;background:#4F46E5;color:white;border:none;padding:6px 12px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;" onmouseover="this.style.background='#4338ca'" onmouseout="this.style.background='#4F46E5'">+ Agregar</button>
+            </div>''')
+        
+        html = f'''
+        <div style="margin:10px 0;border:2px solid #4F46E5;border-radius:12px;padding:15px;background:#f8fafc;">
+            <h3 style="color:#4F46E5;margin:0 0 5px 0;">Propuesta para tu Presupuesto</h3>
+            <p style="color:#666;font-size:12px;margin:0 0 15px 0;">Presupuesto: <strong>${budget:,.2f}</strong> | Ambiente: <strong>{room_type.title()}</strong></p>
+            <div style="max-height:400px;overflow-y:auto;">{"".join(cards)}</div>
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:12px;background:#059669;border-radius:8px;margin-top:12px;">
+                <div>
+                    <div style="color:white;font-size:12px;">TOTAL: <strong style="font-size:18px;">${total:,.2f}</strong></div>
+                    <div style="color:#bbf7d0;font-size:11px;">Te sobran: ${remaining:,.2f}</div>
+                </div>
+                <button class="add-all-btn" style="background:white;color:#059669;border:none;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:bold;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.background='#f0fdf4'" onmouseout="this.style.background='white'">Agregar Todo al Carrito</button>
+            </div>
+        </div>'''
+        
+        return json.dumps({"success": True, "budget": budget, "room_type": room_type, "total": total, "remaining": remaining, "items_count": len(proposal), "proposal": proposal, "html_table": html})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@tool
+async def add_budget_proposal_to_cart() -> str:
+    """
+    Agrega todos los productos de la propuesta de presupuesto al carrito.
+    Usar cuando el cliente acepta la propuesta completa.
+    Si un producto ya está en el carrito, incrementa su cantidad.
+    """
+    try:
+        ctx = get_tool_context()
+        conversation_id = ctx["conversation_id"]
+        user_id = ctx["user_id"]
+        
+        # Try to get mapping from memory first, then from Redis
+        mapping = _session_product_map.get(conversation_id)
+        if not mapping:
+            try:
+                redis = get_redis()
+                mapping = await redis.get_product_mapping(conversation_id)
+                if mapping:
+                    _session_product_map[conversation_id] = mapping
+                    print(f"[PRODUCTS] Loaded {len(mapping.get('products', []))} products from Redis")
+            except Exception as e:
+                print(f"[PRODUCTS] Failed to load from Redis: {e}")
+        
+        if not mapping:
+            return json.dumps({"success": False, "error": "No hay una propuesta activa. Primero dime tu presupuesto para crear una propuesta."})
+        
+        mapping = _session_product_map[conversation_id]
+        
+        # Get product IDs from by_index which has the correct mapping
+        if "by_index" in mapping:
+            product_ids = list(mapping["by_index"].values())
+        else:
+            # Fallback: get from numeric keys (1, 2, 3...)
+            product_ids = [pid for key, pid in mapping.items() if key.isdigit()]
+        
+        if not product_ids:
+            return json.dumps({"success": False, "error": "No hay productos en la propuesta."})
+        
+        stock_service = get_stock_service()
+        
+        # Get current cart to check for existing products
+        current_cart = await stock_service.get_cart_total(conversation_id)
+        existing_product_ids = {item["product_id"] for item in current_cart.get("items", [])}
+        
+        added = []
+        already_in_cart = []
+        failed = []
+        
+        for product_id in product_ids:
+            try:
+                # If product already in cart, increment quantity instead
+                if product_id in existing_product_ids:
+                    print(f"[CART] Product {product_id} already in cart, incrementing...")
+                    result = await stock_service.update_cart_quantity(
+                        conversation_id=conversation_id,
+                        product_id=product_id,
+                        quantity_change=1
+                    )
+                    if result.get("success"):
+                        already_in_cart.append(result.get("product_name", product_id))
+                    else:
+                        print(f"[CART] Failed to increment {product_id}: {result.get('error')}")
+                        failed.append(f"{product_id}: {result.get('error', 'Error')}")
+                else:
+                    print(f"[CART] Adding new product {product_id}...")
+                    result = await stock_service.reserve_stock(
+                        conversation_id=conversation_id, 
+                        user_id=user_id, 
+                        product_id=product_id, 
+                        quantity=1
+                    )
+                    if result.get("success"):
+                        added.append(result.get("product_name", product_id))
+                    else:
+                        print(f"[CART] Failed to add {product_id}: {result.get('error')}")
+                        failed.append(f"{product_id}: {result.get('error', 'Error')}")
+            except Exception as e:
+                print(f"[CART] Exception for {product_id}: {str(e)}")
+                failed.append(f"{product_id}: {str(e)}")
+        
+        cart = await stock_service.get_cart_total(conversation_id)
+        html = _generate_cart_html(cart) if cart.get("items") else ""
+        
+        # Build message
+        parts = []
+        if added:
+            parts.append(f"Agregue {len(added)} productos nuevos")
+        if already_in_cart:
+            parts.append(f"incremente cantidad de {len(already_in_cart)} que ya tenias")
+        
+        message = " y ".join(parts) + "." if parts else "No se agregaron productos."
+        if failed:
+            message += f" ({len(failed)} fallaron por falta de stock)"
+        
+        return json.dumps({
+            "success": True, 
+            "added_count": len(added), 
+            "added_products": added,
+            "incremented_count": len(already_in_cart),
+            "incremented_products": already_in_cart,
+            "failed_count": len(failed),
+            "failed_details": failed,
+            "cart_total": cart.get("total", 0),
+            "cart_items": cart.get("item_count", 0),
+            "html": html,
+            "message": message
+        })
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@tool
+async def get_cross_sell_recommendations(product_id: str = "") -> str:
+    """
+    Obtiene recomendaciones de productos complementarios para cross-selling.
+    Usar despues de que el cliente agrega algo al carrito para sugerir productos que combinan.
+    
+    Args:
+        product_id: ID del producto base (opcional, si no se da usa el ultimo agregado al carrito)
+    """
+    import random
+    try:
+        ctx = get_tool_context()
+        conversation_id = ctx["conversation_id"]
+        
+        db = MongoDB.get_database()
+        stock_service = get_stock_service()
+        pinecone_store = PineconeStore()
+        
+        # Get cart to find what to cross-sell
+        cart = await stock_service.get_cart_total(conversation_id)
+        if not cart.get("items") and not product_id:
+            return json.dumps({"success": False, "error": "Carrito vacio, no hay base para recomendar"})
+        
+        # Get base product category
+        base_product = None
+        if product_id:
+            base_product = await db.products.find_one({"product_id": product_id})
+        elif cart.get("items"):
+            last_item = cart["items"][-1]
+            base_product = await db.products.find_one({"product_id": last_item["product_id"]})
+        
+        if not base_product:
+            return json.dumps({"success": False, "error": "No se encontro producto base"})
+        
+        # Cross-sell mapping by category
+        cross_sell_map = {
+            "Dormitorio": ["Iluminación", "Ropa de Cama", "Decoración"],
+            "Muebles de Sala": ["Iluminación", "Decoración", "Textiles"],
+            "Iluminación": ["Decoración", "Muebles de Sala"],
+            "Comedor": ["Iluminación", "Decoración", "Cocina"],
+            "Ropa de Cama": ["Dormitorio", "Textiles"],
+            "Decoración": ["Iluminación", "Muebles de Sala"],
+            "Baño": ["Decoración", "Textiles"],
+            "Cocina": ["Comedor", "Decoración"]
+        }
+        
+        base_category = base_product.get("category", "")
+        related_categories = cross_sell_map.get(base_category, ["Decoración", "Iluminación"])
+        
+        # Search for complementary products
+        recommendations = []
+        for cat in related_categories[:2]:
+            results = await pinecone_store.search_products(cat, top_k=3)
+            for p in results:
+                if p.get("stock", 0) > 0 and p.get("product_id") != base_product.get("product_id"):
+                    # Add simulated rating
+                    rating = round(random.uniform(4.2, 4.9), 1)
+                    reviews = random.randint(50, 300)
+                    recommendations.append({
+                        "product_id": p.get("product_id") or p.get("id"),
+                        "name": p.get("name"),
+                        "category": p.get("category"),
+                        "price": p.get("price"),
+                        "stock": p.get("stock"),
+                        "rating": rating,
+                        "reviews": reviews,
+                        "reason": f"Combina perfecto con tu {base_product.get('name', 'producto')}"
+                    })
+                    if len(recommendations) >= 3:
+                        break
+            if len(recommendations) >= 3:
+                break
+        
+        if not recommendations:
+            return json.dumps({"success": True, "recommendations": [], "message": "No hay recomendaciones disponibles"})
+        
+        # Generate HTML
+        r2_service = get_r2_service()
+        rows = []
+        for idx, p in enumerate(recommendations, 1):
+            try:
+                image_url = r2_service.get_signed_url(f"products/{p['product_id']}.jpg") if r2_service else ""
+            except:
+                image_url = ""
+            img_html = f'<img src="{image_url}" style="width:40px;height:40px;object-fit:cover;border-radius:4px;">' if image_url else ""
+            stars = "★" * int(p["rating"]) + "☆" * (5 - int(p["rating"]))
+            stock_badge = '<span style="color:#dc2626;font-size:10px;">¡Ultimas unidades!</span>' if p["stock"] < 10 else ""
+            rows.append(f'<tr style="border-bottom:1px solid #eee;"><td style="padding:8px;">{img_html}</td><td style="padding:8px;"><strong>{p["name"]}</strong><br><span style="color:#f59e0b;font-size:11px;">{stars}</span> <span style="font-size:10px;color:#666;">({p["reviews"]} reseñas)</span><br>{stock_badge}</td><td style="padding:8px;text-align:right;font-weight:bold;color:#059669;">${p["price"]:,.2f}</td></tr>')
+        
+        html = f'<div style="margin:10px 0;border:2px solid #f59e0b;border-radius:12px;padding:15px;background:#fffbeb;"><h4 style="color:#d97706;margin:0 0 10px 0;">Clientes que compraron esto tambien llevaron:</h4><table style="width:100%;border-collapse:collapse;font-size:13px;">{"".join(rows)}</table><p style="font-size:11px;color:#666;margin-top:10px;">¿Te gustaria agregar alguno? Solo dime cual.</p></div>'
+        
+        return json.dumps({"success": True, "recommendations": recommendations, "html_table": html, "base_product": base_product.get("name")})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@tool
+async def create_bundle_offer(product_ids: str) -> str:
+    """
+    Crea una oferta de bundle/combo con descuento adicional.
+    Usar cuando el cliente tiene varios productos y se puede ofrecer un descuento por llevar el combo.
+    
+    Args:
+        product_ids: IDs de productos separados por coma para el bundle
+    """
+    try:
+        ctx = get_tool_context()
+        conversation_id = ctx["conversation_id"]
+        
+        db = MongoDB.get_database()
+        stock_service = get_stock_service()
+        
+        # Parse product IDs
+        ids = [pid.strip() for pid in product_ids.split(",")]
+        if len(ids) < 2:
+            return json.dumps({"success": False, "error": "Un bundle necesita al menos 2 productos"})
+        
+        # Get products
+        products = []
+        total_price = 0
+        for pid in ids:
+            product = await db.products.find_one({"product_id": pid})
+            if product and product.get("stock", 0) > 0:
+                products.append(product)
+                total_price += product.get("price", 0)
+        
+        if len(products) < 2:
+            return json.dumps({"success": False, "error": "No se encontraron suficientes productos para el bundle"})
+        
+        # Calculate bundle discount (5% for 2 items, 8% for 3+)
+        discount_percent = 5 if len(products) == 2 else 8
+        discount_amount = total_price * (discount_percent / 100)
+        bundle_price = total_price - discount_amount
+        
+        # Save bundle offer
+        bundle_id = f"BUNDLE-{conversation_id[:8]}"
+        await db.bundle_offers.update_one(
+            {"conversation_id": conversation_id},
+            {"$set": {
+                "bundle_id": bundle_id,
+                "products": [{"product_id": p["product_id"], "name": p["name"], "price": p["price"]} for p in products],
+                "original_total": total_price,
+                "discount_percent": discount_percent,
+                "discount_amount": discount_amount,
+                "bundle_price": bundle_price,
+                "created_at": datetime.utcnow()
+            }},
+            upsert=True
+        )
+        
+        # Generate HTML
+        items_html = "".join([f'<li style="margin:5px 0;">{p["name"]} - ${p["price"]:,.2f}</li>' for p in products])
+        html = f'''
+        <div style="margin:10px 0;border:3px solid #059669;border-radius:12px;padding:15px;background:linear-gradient(135deg,#f0fdf4,#dcfce7);">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                <h4 style="color:#059669;margin:0;">Oferta Combo Especial</h4>
+                <span style="background:#059669;color:white;padding:4px 12px;border-radius:20px;font-weight:bold;">-{discount_percent}%</span>
+            </div>
+            <ul style="margin:10px 0;padding-left:20px;font-size:13px;">{items_html}</ul>
+            <div style="border-top:2px dashed #059669;padding-top:10px;margin-top:10px;">
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#666;">
+                    <span>Precio normal:</span>
+                    <span style="text-decoration:line-through;">${total_price:,.2f}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:13px;color:#059669;">
+                    <span>Tu ahorro:</span>
+                    <span>-${discount_amount:,.2f}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;font-size:18px;font-weight:bold;color:#059669;margin-top:5px;">
+                    <span>Precio Combo:</span>
+                    <span>${bundle_price:,.2f}</span>
+                </div>
+            </div>
+            <p style="font-size:11px;color:#666;margin-top:10px;text-align:center;">Di "acepto el combo" para agregarlo a tu carrito con el descuento.</p>
+        </div>
+        '''
+        
+        return json.dumps({
+            "success": True,
+            "bundle_id": bundle_id,
+            "products_count": len(products),
+            "original_total": total_price,
+            "discount_percent": discount_percent,
+            "discount_amount": discount_amount,
+            "bundle_price": bundle_price,
+            "html": html
+        })
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@tool
+async def check_stock_urgency(product_id: str) -> str:
+    """
+    Verifica el stock de un producto y genera mensaje de urgencia si es bajo.
+    Usar para crear sensacion de escasez cuando el stock es limitado.
+    
+    Args:
+        product_id: ID del producto a verificar
+    """
+    import random
+    try:
+        db = MongoDB.get_database()
+        product = await db.products.find_one({"product_id": product_id})
+        
+        if not product:
+            return json.dumps({"success": False, "error": "Producto no encontrado"})
+        
+        stock = product.get("stock", 0)
+        name = product.get("name", "")
+        
+        # Generate urgency message based on stock level
+        urgency_level = "none"
+        message = ""
+        
+        if stock == 0:
+            urgency_level = "out_of_stock"
+            message = f"Lo siento, {name} esta agotado. ¿Te muestro alternativas similares?"
+        elif stock <= 3:
+            urgency_level = "critical"
+            message = f"¡Solo quedan {stock} unidades de {name}! Este es uno de nuestros productos mas vendidos y vuela rapido."
+        elif stock <= 10:
+            urgency_level = "low"
+            # Simulate recent purchases
+            recent_buyers = random.randint(3, 8)
+            message = f"Stock limitado: quedan {stock} unidades de {name}. {recent_buyers} personas lo compraron en las ultimas 24 horas."
+        elif stock <= 20:
+            urgency_level = "medium"
+            message = f"Disponible: {stock} unidades de {name}. Es uno de nuestros productos populares."
+        else:
+            urgency_level = "normal"
+            message = f"Tenemos {stock} unidades disponibles de {name}."
+        
+        return json.dumps({
+            "success": True,
+            "product_id": product_id,
+            "product_name": name,
+            "stock": stock,
+            "urgency_level": urgency_level,
+            "message": message
+        })
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@tool
+async def offer_financing(total_amount: float) -> str:
+    """
+    Ofrece opciones de financiamiento para el monto dado.
+    Usar cuando el cliente duda por el precio o menciona que es caro.
+    
+    Args:
+        total_amount: Monto total a financiar
+    """
+    try:
+        if total_amount < 100:
+            return json.dumps({"success": False, "error": "Financiamiento disponible para compras mayores a $100"})
+        
+        # Calculate financing options
+        options = []
+        
+        # 3 cuotas sin interés
+        if total_amount >= 100:
+            options.append({"cuotas": 3, "monto_cuota": round(total_amount / 3, 2), "interes": 0, "total": total_amount})
+        
+        # 6 cuotas sin interés
+        if total_amount >= 200:
+            options.append({"cuotas": 6, "monto_cuota": round(total_amount / 6, 2), "interes": 0, "total": total_amount})
+        
+        # 12 cuotas sin interés
+        if total_amount >= 500:
+            options.append({"cuotas": 12, "monto_cuota": round(total_amount / 12, 2), "interes": 0, "total": total_amount})
+        
+        # Generate HTML
+        rows = "".join([f'<tr style="border-bottom:1px solid #eee;"><td style="padding:10px;text-align:center;font-weight:bold;color:#4F46E5;">{o["cuotas"]}x</td><td style="padding:10px;text-align:center;font-size:18px;font-weight:bold;">${o["monto_cuota"]:,.2f}</td><td style="padding:10px;text-align:center;color:#059669;font-weight:bold;">Sin interes</td></tr>' for o in options])
+        
+        html = f'''
+        <div style="margin:10px 0;border:2px solid #4F46E5;border-radius:12px;padding:15px;background:#f8fafc;">
+            <h4 style="color:#4F46E5;margin:0 0 10px 0;">Opciones de Pago - Total: ${total_amount:,.2f}</h4>
+            <table style="width:100%;border-collapse:collapse;font-size:14px;">
+                <thead>
+                    <tr style="background:#4F46E5;color:white;">
+                        <th style="padding:10px;">Cuotas</th>
+                        <th style="padding:10px;">Monto/Cuota</th>
+                        <th style="padding:10px;">Interes</th>
+                    </tr>
+                </thead>
+                <tbody>{rows}</tbody>
+            </table>
+            <p style="font-size:11px;color:#666;margin-top:10px;text-align:center;">Todas las tarjetas de credito aceptadas. El financiamiento se procesa al confirmar la orden.</p>
+        </div>
+        '''
+        
+        return json.dumps({"success": True, "total_amount": total_amount, "options": options, "html": html})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@tool
+async def offer_extended_warranty(product_id: str) -> str:
+    """
+    Ofrece garantia extendida para un producto.
+    Usar despues de que el cliente decide comprar un producto de alto valor.
+    
+    Args:
+        product_id: ID del producto
+    """
+    try:
+        db = MongoDB.get_database()
+        product = await db.products.find_one({"product_id": product_id})
+        
+        if not product:
+            return json.dumps({"success": False, "error": "Producto no encontrado"})
+        
+        price = product.get("price", 0)
+        name = product.get("name", "")
+        
+        # Calculate warranty prices (based on product price)
+        warranty_1y = round(price * 0.05, 2)  # 5% for 1 year
+        warranty_2y = round(price * 0.08, 2)  # 8% for 2 years
+        warranty_3y = round(price * 0.10, 2)  # 10% for 3 years
+        
+        html = f'''
+        <div style="margin:10px 0;border:2px solid #8b5cf6;border-radius:12px;padding:15px;background:#faf5ff;">
+            <h4 style="color:#8b5cf6;margin:0 0 10px 0;">Protege tu {name}</h4>
+            <p style="font-size:12px;color:#666;margin-bottom:10px;">Garantia extendida con cobertura total: reparacion o reemplazo sin costo.</p>
+            <table style="width:100%;border-collapse:collapse;font-size:13px;">
+                <tr style="border-bottom:1px solid #e9d5ff;">
+                    <td style="padding:8px;">+1 año adicional</td>
+                    <td style="padding:8px;text-align:right;font-weight:bold;color:#8b5cf6;">+${warranty_1y:,.2f}</td>
+                </tr>
+                <tr style="border-bottom:1px solid #e9d5ff;">
+                    <td style="padding:8px;">+2 años adicionales</td>
+                    <td style="padding:8px;text-align:right;font-weight:bold;color:#8b5cf6;">+${warranty_2y:,.2f}</td>
+                </tr>
+                <tr style="background:#f3e8ff;">
+                    <td style="padding:8px;font-weight:bold;">+3 años adicionales <span style="color:#059669;font-size:10px;">RECOMENDADO</span></td>
+                    <td style="padding:8px;text-align:right;font-weight:bold;color:#8b5cf6;">+${warranty_3y:,.2f}</td>
+                </tr>
+            </table>
+            <p style="font-size:11px;color:#666;margin-top:10px;">¿Te gustaria agregar garantia extendida? Solo dime cuantos años.</p>
+        </div>
+        '''
+        
+        return json.dumps({
+            "success": True,
+            "product_id": product_id,
+            "product_name": name,
+            "product_price": price,
+            "warranty_options": [
+                {"years": 1, "price": warranty_1y},
+                {"years": 2, "price": warranty_2y},
+                {"years": 3, "price": warranty_3y}
+            ],
+            "html": html
+        })
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@tool
+async def apply_coupon(coupon_code: str) -> str:
+    """
+    Aplica un cupon de descuento al carrito actual.
+    
+    Args:
+        coupon_code: Codigo del cupon a aplicar
+    """
+    try:
+        ctx = get_tool_context()
+        conversation_id = ctx["conversation_id"]
+        
+        db = MongoDB.get_database()
+        stock_service = get_stock_service()
+        
+        cart = await stock_service.get_cart_total(conversation_id)
+        if not cart.get("items"):
+            return json.dumps({"success": False, "error": "El carrito esta vacio"})
+        
+        coupon = await db.coupons.find_one({"code": coupon_code.upper(), "active": True})
+        if not coupon:
+            return json.dumps({"success": False, "error": "Cupon no valido o expirado"})
+        
+        if coupon.get("used_count", 0) >= coupon.get("usage_limit", 0):
+            return json.dumps({"success": False, "error": "Este cupon ya alcanzo su limite de uso"})
+        
+        if cart["total"] < coupon.get("min_purchase", 0):
+            return json.dumps({"success": False, "error": f"Compra minima de ${coupon['min_purchase']} requerida"})
+        
+        if coupon["discount_type"] == "percentage":
+            discount = cart["total"] * (coupon["discount_value"] / 100)
+            discount = min(discount, coupon.get("max_discount", discount))
+        else:
+            discount = coupon["discount_value"]
+        
+        new_total = cart["total"] - discount
+        
+        await db.cart_coupons.update_one(
+            {"conversation_id": conversation_id},
+            {"$set": {"coupon_code": coupon_code.upper(), "discount": discount, "discount_percent": coupon["discount_value"], "original_total": cart["total"], "new_total": new_total, "applied_at": datetime.utcnow()}},
+            upsert=True
+        )
+        
+        return json.dumps({"success": True, "coupon_code": coupon_code.upper(), "discount_percent": coupon["discount_value"], "discount_amount": discount, "original_total": cart["total"], "new_total": new_total, "message": f"Cupon {coupon_code.upper()} aplicado. Descuento: ${discount:,.2f} ({coupon['discount_value']}%)"})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@tool
+async def get_available_coupons() -> str:
+    """
+    Obtiene los cupones disponibles para el cliente.
+    Usar cuando el cliente pregunta por descuentos o promociones.
+    """
+    try:
+        db = MongoDB.get_database()
+        coupons = await db.coupons.find({"active": True, "is_followup": False}).to_list(10)
+        
+        if not coupons:
+            return json.dumps({"success": True, "coupons": [], "message": "No hay cupones disponibles en este momento."})
+        
+        coupon_list = []
+        for c in coupons:
+            if c.get("used_count", 0) < c.get("usage_limit", 0):
+                coupon_list.append({"code": c["code"], "description": c["description"], "discount": f"{c['discount_value']}%" if c["discount_type"] == "percentage" else f"${c['discount_value']}", "min_purchase": c.get("min_purchase", 0)})
+        
+        return json.dumps({"success": True, "coupons": coupon_list, "count": len(coupon_list)})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@tool
+async def apply_followup_discount(level: int = 1) -> str:
+    """
+    Aplica descuento automatico de follow-up.
+    Level 1 = 10%, Level 2 = 15%.
+    Solo usar cuando se ofrece descuento por follow-up.
+    
+    Args:
+        level: Nivel del descuento (1=10%, 2=15%)
+    """
+    try:
+        ctx = get_tool_context()
+        conversation_id = ctx["conversation_id"]
+        
+        db = MongoDB.get_database()
+        stock_service = get_stock_service()
+        
+        cart = await stock_service.get_cart_total(conversation_id)
+        if not cart.get("items"):
+            return json.dumps({"success": False, "error": "El carrito esta vacio"})
+        
+        coupon_code = "FOLLOWUP10" if level == 1 else "FOLLOWUP15"
+        coupon = await db.coupons.find_one({"code": coupon_code, "active": True})
+        
+        if not coupon:
+            return json.dumps({"success": False, "error": "Descuento no disponible"})
+        
+        discount = cart["total"] * (coupon["discount_value"] / 100)
+        discount = min(discount, coupon.get("max_discount", discount))
+        new_total = cart["total"] - discount
+        
+        await db.cart_coupons.update_one(
+            {"conversation_id": conversation_id},
+            {"$set": {"coupon_code": coupon_code, "discount": discount, "discount_percent": coupon["discount_value"], "original_total": cart["total"], "new_total": new_total, "is_followup": True, "followup_level": level, "applied_at": datetime.utcnow()}},
+            upsert=True
+        )
+        
+        await db.coupons.update_one({"code": coupon_code}, {"$inc": {"used_count": 1}})
+        
+        return json.dumps({"success": True, "coupon_code": coupon_code, "discount_percent": coupon["discount_value"], "discount_amount": discount, "original_total": cart["total"], "new_total": new_total, "message": f"Descuento especial del {coupon['discount_value']}% aplicado. Ahorras ${discount:,.2f}!"})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
 @tool
 async def update_cart_quantity(product_id: str, new_quantity: int) -> str:
     """
@@ -924,13 +1826,13 @@ async def update_cart_quantity(product_id: str, new_quantity: int) -> str:
 
 
 @tool
-async def remove_product_from_cart(product_id: str) -> str:
+async def remove_product_from_cart(product_identifier: str) -> str:
     """
     Elimina completamente un producto del carrito.
     Usa esto cuando el cliente quiere quitar un producto especifico.
     
     Args:
-        product_id: Identificador del producto (numero, SKU o nombre)
+        product_identifier: Nombre del producto o parte del nombre (ej: "lampara", "espejo", "lampara de pie")
     """
     try:
         ctx = get_tool_context()
@@ -938,29 +1840,87 @@ async def remove_product_from_cart(product_id: str) -> str:
         
         stock_service = get_stock_service()
         
-        # Resolve product ID
-        resolved_id = await _resolve_product_id(conversation_id, product_id)
+        # Get current cart to find the product
+        cart = await stock_service.get_cart_total(conversation_id)
+        
+        if not cart["items"]:
+            return json.dumps({
+                "success": False,
+                "error": "El carrito esta vacio."
+            })
+        
+        # Convert cart items to product format for similarity matching
+        cart_products = [
+            {"id": item["product_id"], "name": item["product_name"]}
+            for item in cart["items"]
+        ]
+        
+        # Use similarity matching to find the best match
+        best_match = _find_best_match(product_identifier, cart_products, threshold=0.25)
+        
+        if not best_match:
+            # List available products in cart
+            cart_product_names = [f"- {item['product_name']}" for item in cart["items"]]
+            return json.dumps({
+                "success": False,
+                "error": f"No encontre '{product_identifier}' en el carrito.",
+                "cart_products": cart_product_names,
+                "suggestion": "Productos en el carrito:\n" + "\n".join(cart_product_names)
+            })
+        
+        # Find the full item data
+        found_item = next((item for item in cart["items"] if item["product_id"] == best_match["id"]), None)
         
         result = await stock_service.remove_from_cart(
             conversation_id=conversation_id,
-            product_id=resolved_id,
+            product_id=best_match["id"],
             quantity=None  # Remove all
         )
         
         if not result.get("success"):
             return json.dumps(result)
         
-        cart = await stock_service.get_cart_total(conversation_id)
-        html = _generate_cart_html(cart) if cart["items"] else "<p>Tu carrito esta vacio.</p>"
+        updated_cart = await stock_service.get_cart_total(conversation_id)
+        html = _generate_cart_html(updated_cart) if updated_cart["items"] else "<p>Tu carrito esta vacio.</p>"
+        
+        # Store pending discount offer for this specific product (5% off if they add it back)
+        db = MongoDB.get_database()
+        await db.pending_product_discounts.update_one(
+            {"conversation_id": conversation_id, "product_id": best_match["id"]},
+            {
+                "$set": {
+                    "product_name": best_match["name"],
+                    "product_price": found_item["price"] if found_item else 0,
+                    "discount_percent": 5,
+                    "created_at": datetime.utcnow(),
+                    "expires_at": datetime.utcnow() + timedelta(minutes=15)
+                }
+            },
+            upsert=True
+        )
+        
+        # Build discount offer message
+        discounted_price = found_item["price"] * 0.95 if found_item else 0
+        discount_offer = f'''
+        <div style="margin-top:10px;padding:12px;background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;">
+            <div style="font-weight:600;color:#92400e;font-size:13px;">Oferta especial para ti</div>
+            <div style="color:#78350f;font-size:12px;margin-top:4px;">
+                Si decides volver a agregar <strong>{best_match["name"]}</strong>, te doy un <strong>5% de descuento</strong> (${discounted_price:,.2f} en lugar de ${found_item["price"]:,.2f}).
+            </div>
+            <button class="add-back-btn" data-product="{best_match["name"]}" style="margin-top:8px;background:#f59e0b;color:white;border:none;padding:8px 16px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">Agregar con 5% descuento</button>
+        </div>''' if found_item else ""
         
         return json.dumps({
             "success": True,
             "action": "removed",
-            "product_name": result.get("product_name", "Producto"),
-            "cart_total": cart["total"],
-            "cart_items": cart["item_count"],
-            "html": html,
-            "message": f"Producto eliminado del carrito."
+            "product_id": best_match["id"],
+            "product_name": best_match["name"],
+            "cart_total": updated_cart["total"],
+            "cart_items": updated_cart["item_count"],
+            "html": html + discount_offer,
+            "discount_available": True,
+            "discount_percent": 5,
+            "message": f"Eliminado: {best_match['name']} del carrito."
         })
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)})
@@ -1064,7 +2024,7 @@ async def confirm_cart_before_checkout() -> str:
                 </tfoot>
             </table>
             <p style="text-align:center;color:#666;font-size:12px;margin-top:15px;">
-                Los productos estan reservados por 5 minutos. Confirma para continuar con el checkout.
+                Los productos estan reservados por 15 minutos. Confirma para continuar con el checkout.
             </p>
         </div>
         """
@@ -1280,7 +2240,19 @@ SALES_TOOLS = [
     create_order,
     lookup_order,
     cancel_order,
-    escalate_to_human
+    escalate_to_human,
+    # Budget & Coupon tools
+    create_budget_proposal,
+    add_budget_proposal_to_cart,
+    apply_coupon,
+    get_available_coupons,
+    apply_followup_discount,
+    # Sales strategy tools
+    get_cross_sell_recommendations,
+    create_bundle_offer,
+    check_stock_urgency,
+    offer_financing,
+    offer_extended_warranty
 ]
 
 
@@ -1292,11 +2264,13 @@ def get_llm():
     """
     Get the LLM instance. This is the ONLY place where the LLM provider is configured.
     To change providers, just swap ChatOpenAI for ChatAnthropic, ChatGoogleGenerativeAI, etc.
+    
+    OPTIMIZED: Lower temperature for faster, more consistent responses.
     """
     return ChatOpenAI(
         model=settings.openai_model,
         api_key=settings.openai_api_key,
-        temperature=0.7
+        temperature=0.3  # Reduced from 0.7 for faster, more deterministic responses
     )
 
 
@@ -1309,83 +2283,134 @@ def get_system_prompt(user_context: Dict, cart_summary: str) -> str:
 **Herramientas Disponibles:**
 - search_products: Buscar productos en el catalogo
 - check_stock: Verificar stock de un producto
-- add_to_cart: Agregar producto al carrito (acepta #, SKU o nombre del producto)
+- add_to_cart: Agregar producto al carrito (SOLO con numero # o SKU exacto)
 - update_cart_quantity: Cambiar cantidad de un producto en el carrito
 - remove_product_from_cart: Eliminar un producto del carrito
 - clear_cart: Vaciar todo el carrito
 - get_cart: Ver carrito actual
 - confirm_cart_before_checkout: Mostrar resumen antes de pagar
-- get_delivery_slots: Ver horarios de entrega disponibles
-- select_delivery_slot: Seleccionar horario de entrega (USAR cuando el cliente indica un numero de horario)
-- create_order: Crear orden final (SOLO despues de seleccionar horario y tener todos los datos del cliente)
+- get_delivery_slots: Ver horarios de entrega (tabla con codigos A1, B2, etc.)
+- select_delivery_slot: Seleccionar horario con codigo (A1, B2, C3, etc.)
+- create_order: Crear orden final (SOLO despues de seleccionar horario y tener todos los datos)
 - lookup_order: Consultar pedido anterior (requiere numero + monto total)
 - cancel_order: Cancelar pedido (requiere numero + monto total)
 - escalate_to_human: Escalar a supervisor humano
+- create_budget_proposal: Crear propuesta optimizada para un presupuesto
+- add_budget_proposal_to_cart: Agregar toda la propuesta al carrito
+- apply_coupon: Aplicar cupon de descuento
+- get_available_coupons: Ver cupones disponibles
+- apply_followup_discount: Aplicar descuento de follow-up (hasta 20%)
+- get_cross_sell_recommendations: Obtener productos complementarios (USAR despues de agregar al carrito)
+- create_bundle_offer: Crear oferta combo con descuento adicional
+- check_stock_urgency: Verificar stock y generar urgencia si es bajo
+- offer_financing: Mostrar opciones de pago en cuotas
+- offer_extended_warranty: Ofrecer garantia extendida
 
-**IMPORTANTE - Cuando usar add_to_cart vs search_products:**
+**REGLA CRITICA - add_to_cart SOLO CON NUMERO O SKU:**
 
-USA add_to_cart INMEDIATAMENTE cuando el cliente usa verbos de compra/adquisicion:
-- "quiero X" -> add_to_cart
-- "dame X" -> add_to_cart  
-- "agrega X" -> add_to_cart
-- "ponme X" -> add_to_cart
-- "me llevo X" -> add_to_cart
-- "voy a llevar X" -> add_to_cart
-- "necesito X" -> add_to_cart
-- "compro X" -> add_to_cart
+Cuando uses add_to_cart, SIEMPRE pasa el NUMERO de la tabla (1, 2, 3...) o el SKU EXACTO.
+NUNCA pases nombres de productos ni descripciones.
 
-Ejemplos concretos de add_to_cart:
-- "quiero 2 muebles tv" -> add_to_cart(product_id="mueble tv", quantity=2)
-- "dame 1 tocador con espejo" -> add_to_cart(product_id="tocador espejo", quantity=1)
-- "ponme 3 lamparas" -> add_to_cart(product_id="lampara", quantity=3)
-- "me llevo el sofa" -> add_to_cart(product_id="sofa", quantity=1)
+Ejemplos CORRECTOS de add_to_cart:
+- Cliente dice "quiero el primero" -> add_to_cart(product_id="1", quantity=1)
+- Cliente dice "dame el #2" -> add_to_cart(product_id="2", quantity=1)
+- Cliente dice "quiero 2 del tercero" -> add_to_cart(product_id="3", quantity=2)
+- Cliente dice "agrega el ESPEJO-BANO-LED" -> add_to_cart(product_id="ESPEJO-BANO-LED", quantity=1)
 
-USA search_products SOLO para preguntas exploratorias SIN intencion de compra inmediata:
-- "tienes muebles?" -> search_products
-- "que lamparas hay?" -> search_products
-- "muestrame espejos" -> search_products
-- "busco sofas" -> search_products
-- "me gustaria ver opciones de X" -> search_products
+Ejemplos INCORRECTOS (NUNCA hagas esto):
+- add_to_cart(product_id="espejo de baño", quantity=1) <- MAL, usa el numero
+- add_to_cart(product_id="Espejo Decorativo", quantity=1) <- MAL, usa el numero
+- add_to_cart(product_id="el espejo", quantity=1) <- MAL, usa el numero
+
+**REGLA CRITICA - SIEMPRE MOSTRAR OPCIONES PRIMERO:**
+
+NUNCA agregues productos al carrito automaticamente. SIEMPRE usa search_products primero para mostrar opciones al cliente.
+
+Ejemplos:
+- "quiero una cama" -> search_products("cama") -> mostrar opciones -> cliente elige -> add_to_cart
+- "dame un juego de ollas" -> search_products("juego de ollas") -> mostrar opciones -> cliente elige -> add_to_cart
+- "necesito lamparas" -> search_products("lamparas") -> mostrar opciones -> cliente elige -> add_to_cart
+- "me llevo un sofa" -> search_products("sofa") -> mostrar opciones -> cliente elige -> add_to_cart
+
+USA add_to_cart SOLO cuando el cliente:
+1. Ya vio las opciones y elige una especifica: "quiero el #2", "dame el primero", "agrega el SKU-123"
+2. Indica un producto especifico por numero o SKU de la tabla mostrada
+
+El flujo SIEMPRE es: Buscar -> Mostrar opciones -> Cliente elige -> Agregar al carrito (CON NUMERO)
 
 **Proceso de Venta:**
 1. Entender necesidad -> search_products
 2. Mostrar opciones con tabla (imagen, precio, stock, SKU)
-3. Cliente elige -> add_to_cart (reserva 5 min)
-4. Si quiere modificar -> update_cart_quantity o remove_product_from_cart
-5. Antes de checkout -> confirm_cart_before_checkout
-6. Cliente confirma -> get_delivery_slots (muestra lista numerada de horarios)
-7. Cliente selecciona horario -> select_delivery_slot(slot_number=X)
-   IMPORTANTE: Cuando el cliente dice "el 17", "quiero el horario 3", "el domingo a las 12" (buscar el numero correspondiente), etc. -> USA select_delivery_slot
-8. Recopilar datos del cliente:
-   - Nombre completo
-   - Tipo documento (DNI, RUC, CE, Pasaporte)
-   - Numero documento
-   - Telefono
-   - Email
-   - Direccion
-   - Referencia (opcional)
-9. Crear orden -> create_order (ya tiene el horario guardado)
+3. Cliente elige -> add_to_cart (reserva 15 min) - AGREGA INMEDIATAMENTE sin pedir confirmacion
+4. DESPUES de agregar al carrito -> get_cross_sell_recommendations() para sugerir complementos
+5. Si quiere modificar -> update_cart_quantity o remove_product_from_cart
+6. Antes de checkout -> confirm_cart_before_checkout
+7. Cliente confirma -> get_delivery_slots (muestra tabla con codigos A1, B2, etc.)
+8. Cliente selecciona horario -> select_delivery_slot(slot_code="A2")
+9. Pedir datos del cliente (nombre, DNI, telefono, email, direccion)
+10. Cuando tenga TODOS los datos -> create_order(...)
+
+**CRITICO - Agregar al Carrito:**
+- Cuando el cliente dice "quiero el 1" o "agrega el edredon" -> USA add_to_cart INMEDIATAMENTE
+- NO pidas confirmacion, NO preguntes "confirmo que agregue?", simplemente AGREGALO
+- Si el cliente ya vio productos y dice un numero o nombre, AGREGALO sin volver a buscar
 
 **CRITICO - Seleccion de Horario:**
-Cuando el cliente indica un numero de horario de la lista mostrada, SIEMPRE usa select_delivery_slot:
-- "el 17" -> select_delivery_slot(slot_number=17)
-- "quiero el horario 3" -> select_delivery_slot(slot_number=3)
-- "prefiero el 5" -> select_delivery_slot(slot_number=5)
-- "el primero" -> select_delivery_slot(slot_number=1)
-- "el ultimo" -> select_delivery_slot(slot_number=25) (o el numero correspondiente)
-NO vuelvas a mostrar la lista de horarios si el cliente ya eligio uno.
+La tabla muestra dias como filas (A=primer dia, B=segundo, etc.) y horas como columnas (1=09-12h, 2=12-15h, 3=15-18h, 4=18-21h).
+- "A2" -> select_delivery_slot(slot_code="A2") = Primer dia, 12-15h
+- "D2" -> select_delivery_slot(slot_code="D2") = Cuarto dia, 12-15h
+- Cuando el cliente dice un codigo como "D2" -> USA select_delivery_slot INMEDIATAMENTE
+- NO vuelvas a mostrar la tabla si el cliente ya eligio uno
+- NO vuelvas a llamar select_delivery_slot si ya lo seleccionaste
 
-**Consulta de Pedidos:**
-- Para consultar un pedido: pedir numero de orden + monto total (seguridad)
-- Para cancelar: solo pedidos en estado "confirmed"
+**CRITICO - Crear Orden:**
+- SOLO llama create_order UNA VEZ cuando tengas TODOS los datos del cliente
+- Si ya llamaste create_order exitosamente, NO lo vuelvas a llamar
+- Si el cliente dice "procede" y ya tienes los datos, llama create_order
+- Si falta algun dato, PREGUNTA por el dato faltante, no repitas select_delivery_slot
+
+**ESTRATEGIAS DE VENTA (USAR ACTIVAMENTE):**
+
+1. CROSS-SELLING: Despues de agregar al carrito, SIEMPRE usa get_cross_sell_recommendations() para sugerir productos complementarios.
+
+2. URGENCIA/ESCASEZ: Si el stock es bajo, usa check_stock_urgency() para crear sensacion de urgencia.
+   - "Solo quedan 3 unidades!"
+   - "X personas lo compraron hoy"
+
+3. BUNDLES: Si el cliente tiene 2+ productos, ofrece create_bundle_offer() con descuento adicional (5-8%).
+
+4. FINANCIAMIENTO: Si el cliente duda por precio o dice "es caro", usa offer_financing() para mostrar cuotas sin interes.
+
+5. GARANTIA EXTENDIDA: Para productos de alto valor (>$300), ofrece offer_extended_warranty().
+
+6. SOCIAL PROOF: Menciona ratings y reseñas de los productos cuando los muestres.
+
+**CRITICO - CUANDO EL CLIENTE ELIMINA O REDUCE PRODUCTOS:**
+Actua como un vendedor real que quiere retener la venta:
+- Si elimina un producto: Pregunta amablemente "¿Hubo algo que no te convencio?" y ofrece:
+  1. Un descuento del 5% si lo vuelve a agregar (el sistema ya lo guarda automaticamente)
+  2. Sugerir un producto alternativo similar pero mas economico
+  3. Preguntar si el precio es el problema para ofrecer financiamiento
+- Si reduce cantidad: Pregunta si hay algo que puedas mejorar y menciona que con mas unidades podria obtener mejor precio
+- NUNCA solo digas "listo, eliminado" - siempre intenta recuperar la venta
+- Muestra el boton de "Agregar con 5% descuento" que viene en el HTML de la respuesta
+
+**PRESUPUESTO:**
+- "tengo X dolares para amoblar" -> create_budget_proposal(budget=X, room_type="general")
+- "presupuesto de X para la sala" -> create_budget_proposal(budget=X, room_type="sala")
+
+**CUPONES Y DESCUENTOS:**
+- Preguntas por descuentos -> get_available_coupons()
+- Aplicar cupon -> apply_coupon(coupon_code="CODIGO")
+- Follow-up con descuento -> apply_followup_discount(level=X) donde X es el % (5, 8, 10, 12, 15, 18, 20)
 
 **Reglas CRITICAS:**
 - NUNCA inventes precios o stock
 - SIEMPRE usa las herramientas para datos reales
 - NO ofrezcas productos sin stock
-- Los productos se reservan 5 minutos
-- Para consultar/cancelar pedidos: SIEMPRE pedir numero + monto total
-- Cuando el cliente dice "quiero", "dame", "agrega", "ponme", "me llevo" + producto -> USA add_to_cart, NO search_products
+- Los productos se reservan 15 minutos
+- SE PROACTIVO: sugiere productos, ofrece descuentos, crea urgencia
+- Actua como un vendedor real que quiere cerrar la venta
 
 **Contexto del Cliente:**
 {user_context.get('system_prompt', '')}
@@ -1420,6 +2445,14 @@ async def sales_agent_node_v3(state: AgentState) -> AgentState:
     if cart_data.get("items"):
         cart_summary = f"{cart_data['item_count']} items, Total: ${cart_data['total']:,.2f}"
     
+    # Get memory state (resumen de conversación anterior)
+    memory_state = await get_memory_state(conversation_id)
+    conversation_summary = memory_state.get("summary", "")
+    
+    if conversation_summary:
+        print(f"\n[AGENT] Inyectando resumen de memoria ({len(conversation_summary)} chars)")
+        print(f"[AGENT] Resumen: {conversation_summary[:200]}...")
+    
     try:
         # Get LLM with tools bound
         llm = get_llm()
@@ -1427,10 +2460,16 @@ async def sales_agent_node_v3(state: AgentState) -> AgentState:
         
         # Build messages for LLM
         system_prompt = get_system_prompt(user_context, cart_summary)
+        
+        # Inject conversation summary if exists
+        if conversation_summary:
+            system_prompt += f"\n\n**RESUMEN DE LA CONVERSACIÓN ANTERIOR:**\n{conversation_summary}"
+        
         lc_messages = [SystemMessage(content=system_prompt)]
         
         # Add recent conversation messages (limit to last 10)
         recent_messages = messages[-10:] if len(messages) > 10 else messages
+        print(f"[AGENT] Enviando {len(recent_messages)} mensajes recientes al LLM")
         for msg in recent_messages:
             content = msg.get("content", "")
             if content and len(content) > 2000:
@@ -1486,7 +2525,7 @@ async def sales_agent_node_v3(state: AgentState) -> AgentState:
                         reasoning_steps.append({
                             "agent": "StockReservation",
                             "action": "reserve",
-                            "reasoning": f"Reserva creada: {result.get('product_name')} x{func_args.get('quantity', 1)} por 5 minutos",
+                            "reasoning": f"Reserva creada: {result.get('product_name')} x{func_args.get('quantity', 1)} por 15 minutos",
                             "timestamp": datetime.utcnow().isoformat(),
                             "result": {"reserved_until": result.get("reserved_until")}
                         })

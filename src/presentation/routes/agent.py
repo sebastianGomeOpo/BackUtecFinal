@@ -41,6 +41,7 @@ class ConversationResponse(BaseModel):
     escalation: Optional[dict] = None
     reasoning_trace: Optional[List[dict]] = []
     cart: Optional[List[dict]] = []
+    coupon: Optional[dict] = None
 
 
 # Endpoints
@@ -90,6 +91,18 @@ async def send_message(request: SendMessageRequest):
             user_id=request.user_id
         )
         
+        # Check for applied coupon
+        coupon_data = await db.cart_coupons.find_one({"conversation_id": request.conversation_id})
+        coupon = None
+        if coupon_data:
+            coupon = {
+                "coupon_code": coupon_data.get("coupon_code"),
+                "discount_percent": coupon_data.get("discount_percent"),
+                "discount_amount": coupon_data.get("discount"),
+                "original_total": coupon_data.get("original_total"),
+                "new_total": coupon_data.get("new_total")
+            }
+        
         return ConversationResponse(
             conversation_id=result["conversation_id"],
             message=result["message"],
@@ -97,7 +110,8 @@ async def send_message(request: SendMessageRequest):
             requires_human=result.get("requires_human", False),
             escalation=result.get("escalation"),
             reasoning_trace=result.get("reasoning_trace", []),
-            cart=result.get("cart", [])
+            cart=result.get("cart", []),
+            coupon=coupon
         )
     except Exception as e:
         import traceback
@@ -465,5 +479,41 @@ async def get_followup_status(conversation_id: str):
         status = await monitor.get_followup_status(conversation_id)
         
         return status
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/followup/messages/{conversation_id}")
+async def get_followup_messages(conversation_id: str, since: str = None):
+    """Get pending follow-up messages for a conversation (for polling)"""
+    try:
+        db = MongoDB.get_database()
+        
+        query = {
+            "conversation_id": conversation_id,
+            "type": "followup"
+        }
+        
+        if since:
+            from datetime import datetime
+            try:
+                since_dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
+                query["timestamp"] = {"$gt": since_dt}
+            except:
+                pass
+        
+        cursor = db.conversation_messages.find(query).sort("timestamp", 1)
+        messages = []
+        async for doc in cursor:
+            doc.pop("_id", None)
+            if hasattr(doc.get("timestamp"), "isoformat"):
+                doc["timestamp"] = doc["timestamp"].isoformat()
+            messages.append(doc)
+        
+        return {
+            "conversation_id": conversation_id,
+            "messages": messages,
+            "count": len(messages)
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
