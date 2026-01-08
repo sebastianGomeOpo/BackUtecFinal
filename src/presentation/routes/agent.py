@@ -42,6 +42,7 @@ class ConversationResponse(BaseModel):
     reasoning_trace: Optional[List[dict]] = []
     cart: Optional[List[dict]] = []
     coupon: Optional[dict] = None
+    conversation_stage: Optional[str] = None  # discovery, proposal, optimization, commitment, checkout, completed
 
 
 # Endpoints
@@ -91,6 +92,10 @@ async def send_message(request: SendMessageRequest):
             user_id=request.user_id
         )
         
+        # Reset follow-up timer AFTER assistant responds (not when user sends message)
+        monitor = get_followup_monitor()
+        await monitor.reset_timer(request.conversation_id)
+        
         # Check for applied coupon
         coupon_data = await db.cart_coupons.find_one({"conversation_id": request.conversation_id})
         coupon = None
@@ -111,7 +116,8 @@ async def send_message(request: SendMessageRequest):
             escalation=result.get("escalation"),
             reasoning_trace=result.get("reasoning_trace", []),
             cart=result.get("cart", []),
-            coupon=coupon
+            coupon=coupon,
+            conversation_stage=result.get("conversation_stage", "discovery")
         )
     except Exception as e:
         import traceback
@@ -412,19 +418,35 @@ async def start_followup_monitoring(conversation_id: str):
         async def followup_callback(conv_id: str, message: str):
             # Store follow-up message in conversation
             db = MongoDB.get_database()
+            timestamp = datetime.utcnow()
             await db.conversation_messages.insert_one({
                 "conversation_id": conv_id,
                 "role": "assistant",
                 "content": message,
                 "type": "followup",
-                "timestamp": datetime.utcnow()
+                "timestamp": timestamp
             })
+            
+            # Also add to LangGraph state so agent has context
+            try:
+                graph = get_sales_graph()
+                config = {"configurable": {"thread_id": conv_id}}
+                followup_message = {
+                    "role": "assistant",
+                    "content": message,
+                    "timestamp": timestamp.isoformat(),
+                    "type": "followup"
+                }
+                await graph.app.aupdate_state(config, {"messages": [followup_message]})
+            except Exception as e:
+                print(f"[FOLLOWUP] Error adding to graph state: {e}")
+            
             # Broadcast to WebSocket
             await manager.broadcast({
                 "type": "followup",
                 "conversation_id": conv_id,
                 "message": message,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": timestamp.isoformat()
             })
         
         await monitor.initialize_conversation(conversation_id)

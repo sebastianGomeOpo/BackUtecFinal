@@ -10,6 +10,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import json
 import re
+import unicodedata
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
@@ -26,6 +27,9 @@ from ...services.upstash_redis import get_redis
 
 # Session product mapping (index/SKU -> UUID) - NOT a cache, needed for "producto 1" resolution
 _session_product_map: Dict[str, Dict[str, Any]] = {}
+
+# Quote counter per conversation for generating unique quote IDs (A, B, C, etc.)
+_quote_counter: Dict[str, int] = {}
 
 # Tool context (conversation_id, user_id)
 _tool_context: Dict[str, Dict[str, str]] = {}
@@ -50,20 +54,68 @@ def get_tool_context() -> Dict[str, str]:
 # HELPER FUNCTIONS
 # ============================================================================
 
-def _save_product_mapping(conversation_id: str, products: List[Dict]):
-    """Save multiple mappings: index, SKU, and name -> product_id"""
+def _get_next_quote_id(conversation_id: str) -> str:
+    """Generate next quote ID for a conversation (A, B, C, ... Z, AA, AB, ...)"""
+    global _quote_counter
+    if conversation_id not in _quote_counter:
+        _quote_counter[conversation_id] = 0
+    
+    count = _quote_counter[conversation_id]
+    _quote_counter[conversation_id] += 1
+    
+    # Convert to letter(s): 0=A, 1=B, ..., 25=Z, 26=AA, etc.
+    if count < 26:
+        return chr(65 + count)  # A-Z
+    else:
+        first = chr(65 + (count // 26) - 1)
+        second = chr(65 + (count % 26))
+        return first + second
+
+
+def _save_product_mapping(conversation_id: str, products: List[Dict], quote_id: str = None):
+    """Save multiple mappings: quote_id+index, SKU, and name -> product_id
+    
+    Products are now identified by quote_id + index (e.g., A1, A2, B1, B2)
+    This prevents conflicts when user does multiple searches.
+    """
     global _session_product_map
-    mapping = {
-        "by_index": {},
+    
+    if quote_id is None:
+        quote_id = _get_next_quote_id(conversation_id)
+    
+    # Get existing mapping or create new one
+    existing = _session_product_map.get(conversation_id, {
+        "by_code": {},  # New: A1, A2, B1, B2, etc.
+        "by_index": {},  # Keep for backwards compatibility (last search only)
         "by_sku": {},
         "by_name": {},
-        "products": products
-    }
+        "products": [],
+        "current_quote": quote_id
+    })
+    
+    # Update current quote
+    existing["current_quote"] = quote_id
+    
+    # Clear by_index for new search (backwards compatibility)
+    existing["by_index"] = {}
+    
+    # Add new products with quote_id prefix
     for p in products:
-        mapping["by_index"][p["index"]] = p["id"]
-        mapping["by_sku"][p["sku"].upper()] = p["id"]
-        mapping["by_name"][p["name"].lower()] = p["id"]
-    _session_product_map[conversation_id] = mapping
+        code = f"{quote_id}{p['index']}"  # e.g., A1, A2, B1, B2
+        existing["by_code"][code] = p["id"]
+        existing["by_index"][p["index"]] = p["id"]  # Also keep simple index for last search
+        existing["by_sku"][p["sku"].upper()] = p["id"]
+        existing["by_name"][p["name"].lower()] = p["id"]
+    
+    # Store products with their quote_id
+    for p in products:
+        p["quote_id"] = quote_id
+        p["code"] = f"{quote_id}{p['index']}"
+    existing["products"] = products  # Replace with latest products
+    
+    _session_product_map[conversation_id] = existing
+    
+    return quote_id
 
 
 def _calculate_similarity(text1: str, text2: str) -> float:
@@ -128,7 +180,13 @@ def _find_best_match(identifier: str, products: List[Dict], threshold: float = 0
 
 
 async def _resolve_product_id(conversation_id: str, identifier: str) -> str:
-    """Resolve product by index, SKU, or name similarity from session mapping.
+    """Resolve product by code (A1, B2), index, SKU, or name similarity from session mapping.
+    
+    Priority:
+    1. Code format (A1, B2, etc.) - most reliable, identifies specific search
+    2. Simple index (1, 2, 3) - uses last search only (backwards compatibility)
+    3. SKU exact/partial match
+    4. Name similarity matching
     
     Uses fuzzy matching to find products even with partial or misspelled names.
     Only searches within products shown to the user in the current conversation.
@@ -147,10 +205,20 @@ async def _resolve_product_id(conversation_id: str, identifier: str) -> str:
     if not mapping:
         return None
     
-    # Try to parse as index (1, 2, 3...) - MOST COMMON CASE
+    # Try code format first (A1, B2, C3, etc.) - NEW PRIORITY
+    code_pattern = re.compile(r'^([A-Z]+)(\d+)$', re.IGNORECASE)
+    code_match = code_pattern.match(identifier.upper())
+    if code_match:
+        code = identifier.upper()
+        if code in mapping.get("by_code", {}):
+            print(f"[PRODUCTS] Resolved code {code} to product")
+            return mapping["by_code"][code]
+    
+    # Try to parse as simple index (1, 2, 3...) - uses LAST search only
     try:
         index = int(identifier)
         if index in mapping.get("by_index", {}):
+            print(f"[PRODUCTS] Resolved index {index} to product (last search)")
             return mapping["by_index"][index]
         # Index out of range
         return None
@@ -183,40 +251,58 @@ async def _resolve_product_id(conversation_id: str, identifier: str) -> str:
     return None
 
 
-def _generate_products_table(products: List[Dict]) -> str:
-    """Generate HTML cards for products with add buttons"""
+def _generate_products_table(products: List[Dict], quote_id: str = "A") -> str:
+    """Generate HTML grid cards for products with add and details buttons.
+    
+    Products are identified by SKU for clarity and consistency.
+    Grid layout: 4 columns on desktop, responsive on mobile.
+    """
     if not products:
         return "<p>No hay productos disponibles.</p>"
     
     cards = []
     for p in products:
-        stock_badge = f'<span style="color:#059669;font-size:11px;">{p["stock"]} disponibles</span>' if p["available"] else '<span style="color:#dc2626;font-size:11px;">Sin stock</span>'
-        image_html = f'<img src="{p["image_url"]}" alt="{p["name"]}" style="width:80px;height:80px;object-fit:cover;border-radius:8px;">' if p["image_url"] else '<div style="width:80px;height:80px;background:#f3f4f6;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#9ca3af;">Sin img</div>'
+        sku = p.get("sku", "N/A")
+        stock_badge = f'<span style="color:#059669;font-size:10px;font-weight:500;">{p["stock"]} disponibles</span>' if p["available"] else '<span style="color:#dc2626;font-size:10px;font-weight:500;">Sin stock</span>'
+        image_html = f'<img src="{p["image_url"]}" alt="{p["name"]}" style="width:100%;height:140px;object-fit:cover;border-radius:8px 8px 0 0;">' if p.get("image_url") else '<div style="width:100%;height:140px;background:linear-gradient(135deg,#f3f4f6,#e5e7eb);border-radius:8px 8px 0 0;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:12px;">Sin imagen</div>'
         
         card = f'''
-        <div class="product-card" data-index="{p["index"]}" data-name="{p["name"]}" style="display:flex;gap:12px;padding:12px;background:white;border-radius:12px;border:1px solid #e5e7eb;margin-bottom:10px;transition:all 0.2s;cursor:pointer;" onmouseover="this.style.borderColor='#4F46E5';this.style.boxShadow='0 4px 12px rgba(79,70,229,0.15)'" onmouseout="this.style.borderColor='#e5e7eb';this.style.boxShadow='none'">
-            <div style="flex-shrink:0;">{image_html}</div>
-            <div style="flex:1;min-width:0;">
-                <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
-                    <span style="background:#4F46E5;color:white;font-size:11px;font-weight:bold;padding:2px 8px;border-radius:10px;">#{p["index"]}</span>
-                    <span style="font-size:10px;color:#6b7280;background:#f3f4f6;padding:2px 6px;border-radius:4px;">{p["category"]}</span>
-                </div>
-                <div style="font-weight:600;color:#1f2937;font-size:14px;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{p["name"]}</div>
-                <div style="font-size:10px;color:#9ca3af;margin-bottom:6px;">SKU: {p["sku"]}</div>
-                <div style="display:flex;align-items:center;justify-content:space-between;">
-                    <div>
-                        <span style="font-size:18px;font-weight:bold;color:#059669;">${p["price"]:,.2f}</span>
-                        <div>{stock_badge}</div>
+        <div class="product-card" data-code="{sku}" data-sku="{sku}" data-name="{p["name"]}" style="background:white;border-radius:12px;border:1px solid #e5e7eb;overflow:hidden;transition:all 0.3s ease;cursor:pointer;display:flex;flex-direction:column;" onmouseover="this.style.transform='translateY(-4px)';this.style.boxShadow='0 12px 24px rgba(0,0,0,0.1)'" onmouseout="this.style.transform='translateY(0)';this.style.boxShadow='none'">
+            <div style="position:relative;">
+                {image_html}
+                <span style="position:absolute;top:8px;left:8px;background:rgba(79,70,229,0.9);color:white;font-size:9px;font-weight:600;padding:3px 8px;border-radius:4px;">{p["category"]}</span>
+            </div>
+            <div style="padding:12px;flex:1;display:flex;flex-direction:column;">
+                <div style="font-weight:600;color:#1f2937;font-size:13px;margin-bottom:4px;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:34px;">{p["name"]}</div>
+                <div style="font-size:9px;color:#9ca3af;margin-bottom:8px;font-family:monospace;">{sku}</div>
+                <div style="margin-top:auto;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                        <span style="font-size:18px;font-weight:700;color:#059669;">${p["price"]:,.2f}</span>
+                        {stock_badge}
                     </div>
-                    <button class="add-btn" data-index="{p["index"]}" style="background:#4F46E5;color:white;border:none;padding:8px 16px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:4px;transition:background 0.2s;" onmouseover="this.style.background='#4338ca'" onmouseout="this.style.background='#4F46E5'">
-                        <span style="font-size:16px;">+</span> Agregar
-                    </button>
+                    <div style="display:flex;gap:6px;">
+                        <button class="details-btn" data-code="{sku}" style="flex:1;background:#f3f4f6;color:#374151;border:none;padding:8px;border-radius:6px;font-size:10px;font-weight:600;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.background='#e5e7eb'" onmouseout="this.style.background='#f3f4f6'">
+                            Detalles
+                        </button>
+                        <button class="add-btn" data-code="{sku}" data-sku="{sku}" style="flex:1;background:#4F46E5;color:white;border:none;padding:8px;border-radius:6px;font-size:10px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:4px;transition:all 0.2s;" onmouseover="this.style.background='#4338ca'" onmouseout="this.style.background='#4F46E5'">
+                            <span style="font-size:12px;">+</span> Agregar
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>'''
         cards.append(card)
     
-    html = f'<div style="margin:10px 0;">{"".join(cards)}</div>'
+    # Grid header
+    header = f'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;"><div style="display:flex;align-items:center;gap:8px;"><span style="font-size:14px;font-weight:600;color:#1f2937;">{len(products)} productos encontrados</span></div></div>'
+    
+    # CSS Grid layout - 4 columns on desktop, 2 on tablet, 1 on mobile
+    grid_style = "display:grid;grid-template-columns:repeat(4,1fr);gap:16px;"
+    
+    html = f'''<div style="margin:10px 0;">
+        {header}
+        <div style="{grid_style}">{"".join(cards)}</div>
+    </div>'''
     
     return html
 
@@ -393,13 +479,15 @@ def _generate_final_order_html(order: Dict) -> str:
 # ============================================================================
 
 @tool
-async def search_products(query: str, limit: int = 5) -> str:
+async def search_products(query: str, limit: int = 5, max_price: float = None) -> str:
     """
     Busca productos en el catalogo. Devuelve una tabla con imagen, precio y stock disponible.
+    Si se especifica max_price, filtra productos dentro del presupuesto y los ordena de mayor a menor precio.
     
     Args:
         query: Termino de busqueda (ej: 'sofa', 'lampara', 'mesa')
         limit: Numero maximo de resultados (default: 5)
+        max_price: Presupuesto maximo en dolares (opcional). Si se especifica, filtra y ordena por precio descendente.
     """
     try:
         ctx = get_tool_context()
@@ -409,7 +497,9 @@ async def search_products(query: str, limit: int = 5) -> str:
         stock_service = get_stock_service()
         r2_service = get_r2_service()
         
-        results = await vectorstore.search_products(query=query, top_k=limit)
+        # Search for more results to filter (we filter by name/category match and optionally by price)
+        search_limit = limit * 5  # Get more results since we'll filter strictly
+        results = await vectorstore.search_products(query=query, top_k=search_limit)
         
         if not results:
             return json.dumps({
@@ -422,43 +512,128 @@ async def search_products(query: str, limit: int = 5) -> str:
         db = MongoDB.get_database()
         products = []
         
-        for i, result in enumerate(results):
+        # Normalize query for matching - remove accents for flexible matching
+        def normalize_text(text: str) -> str:
+            """Remove accents and normalize text for matching"""
+            text = text.lower().strip()
+            # Remove accents
+            text = unicodedata.normalize('NFD', text)
+            text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')
+            return text
+        
+        def get_stem(word: str) -> str:
+            """Simple stemming - remove common Spanish suffixes for flexible matching"""
+            word = word.lower()
+            # Remove plural 's' and common endings
+            if word.endswith('as') and len(word) > 4:
+                return word[:-1]  # lamparas -> lampara
+            if word.endswith('es') and len(word) > 4:
+                return word[:-2]  # espejos doesn't apply, but flores -> flor
+            if word.endswith('s') and len(word) > 3:
+                return word[:-1]  # ollas -> olla
+            return word
+        
+        query_normalized = normalize_text(query)
+        query_terms = query_normalized.split()
+        query_stems = [get_stem(normalize_text(t)) for t in query_terms if len(t) > 2]
+        
+        for result in results:
             product_id = result.get("id")
             product = await db.products.find_one({"id": product_id})
             
             if product:
+                price = product.get("price", 0)
+                name_normalized = normalize_text(product.get("name", ""))
+                category_normalized = normalize_text(product.get("category", ""))
+                
+                # Filter: product name or category must contain at least one query term or stem
+                # Uses normalized text (no accents) and stems for flexible matching
+                # This allows "lamparas" to match "lámpara", "ollas" to match "olla"
+                matches_query = any(
+                    term in name_normalized or term in category_normalized or
+                    stem in name_normalized or stem in category_normalized
+                    for term, stem in zip(query_terms, query_stems)
+                )
+                if not matches_query:
+                    continue
+                
+                # Filter by max_price if specified
+                if max_price and price > max_price:
+                    continue
+                
                 available_stock = await stock_service.get_available_stock(product_id)
                 
                 image_key = product.get("image_key", "")
-                image_url = ""
+                placeholder_img = "https://img.freepik.com/vector-premium/vector-icono-imagen-predeterminado-pagina-imagen-faltante-diseno-sitio-web-o-aplicacion-movil-no-hay-foto-disponible_87543-11093.jpg"
+                image_url = placeholder_img
                 if image_key:
                     try:
-                        image_url = r2_service.get_signed_url(image_key, expires_in=3600)
+                        image_url = r2_service.get_signed_url(image_key, expires_in=3600) or placeholder_img
                     except:
-                        image_url = ""
+                        image_url = placeholder_img
                 
                 products.append({
-                    "index": i + 1,
                     "id": product_id,
                     "name": product.get("name"),
                     "description": product.get("description", "")[:100] + "...",
                     "category": product.get("category"),
-                    "price": product.get("price", 0),
+                    "price": price,
                     "stock": available_stock,
                     "available": available_stock > 0,
                     "image_url": image_url,
                     "sku": product.get("sku", "")
                 })
         
-        _save_product_mapping(conversation_id, products)
-        html_table = _generate_products_table(products)
+        # If max_price specified, sort by price descending (most expensive first within budget)
+        if max_price:
+            products.sort(key=lambda x: x["price"], reverse=True)
+        
+        # Limit results and assign indices
+        products = products[:limit]
+        for i, p in enumerate(products):
+            p["index"] = i + 1
+        
+        if not products:
+            budget_msg = f" dentro de tu presupuesto de ${max_price:,.2f}" if max_price else ""
+            return json.dumps({
+                "success": True,
+                "products": [],
+                "html_table": f"<p>No se encontraron productos{budget_msg} para: {query}</p>",
+                "message": f"No se encontraron productos{budget_msg}"
+            })
+        
+        quote_id = _save_product_mapping(conversation_id, products)
+        
+        # Add quote_id and code to products for display
+        for p in products:
+            p["quote_id"] = quote_id
+            p["code"] = f"{quote_id}{p['index']}"
+        
+        html_table = _generate_products_table(products, quote_id)
+        
+        # Mark that user has viewed products (for follow-up context)
+        try:
+            await db.conversation_activity.update_one(
+                {"conversation_id": conversation_id},
+                {"$set": {"has_viewed_products": True, "last_product_view": datetime.utcnow()}},
+                upsert=True
+            )
+        except Exception:
+            pass  # Non-critical
+        
+        # Add budget info to response if specified
+        budget_info = ""
+        if max_price:
+            budget_info = f" (presupuesto: ${max_price:,.2f})"
         
         return json.dumps({
             "success": True,
             "products": products,
             "html_table": html_table,
             "count": len(products),
-            "query": query
+            "query": query,
+            "max_price": max_price,
+            "message": f"Encontre {len(products)} productos{budget_info}"
         })
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)})
@@ -492,6 +667,98 @@ async def check_stock(product_id: str) -> str:
             "reserved": product.stock - available_stock,
             "available": available_stock > 0,
             "price": product.price
+        })
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+
+
+@tool
+async def get_product_details(product_code: str) -> str:
+    """
+    Muestra detalles completos de un producto: descripcion, especificaciones, imagen grande.
+    Usar cuando el cliente quiere ver mas informacion de un producto antes de agregarlo.
+    
+    Args:
+        product_code: Codigo del producto (A1, B2, etc.) o SKU
+    """
+    try:
+        ctx = get_tool_context()
+        conversation_id = ctx["conversation_id"]
+        
+        # Resolve product ID from code
+        product_id = await _resolve_product_id(conversation_id, product_code)
+        
+        if not product_id:
+            return json.dumps({
+                "success": False, 
+                "error": f"No encontre el producto '{product_code}'. Verifica el codigo en la lista de productos."
+            })
+        
+        db = MongoDB.get_database()
+        product = await db.products.find_one({"id": product_id})
+        
+        if not product:
+            return json.dumps({"success": False, "error": "Producto no encontrado en la base de datos"})
+        
+        stock_service = get_stock_service()
+        available_stock = await stock_service.get_available_stock(product_id)
+        
+        r2_service = get_r2_service()
+        placeholder_img = "https://img.freepik.com/vector-premium/vector-icono-imagen-predeterminado-pagina-imagen-faltante-diseno-sitio-web-o-aplicacion-movil-no-hay-foto-disponible_87543-11093.jpg"
+        image_url = placeholder_img
+        image_key = product.get("image_key", "")
+        if image_key:
+            try:
+                image_url = r2_service.get_signed_url(image_key, expires_in=3600) or placeholder_img
+            except:
+                pass
+        
+        # Build detailed HTML card with modern design
+        sku = product.get("sku", "N/A")
+        stock_status = f'<span style="color:#059669;font-weight:600;">{available_stock} disponibles</span>' if available_stock > 0 else '<span style="color:#dc2626;font-weight:600;">Sin stock</span>'
+        
+        # Get specifications if available
+        specs = product.get("specifications", {})
+        specs_html = ""
+        if specs:
+            specs_items = "".join([f'<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f3f4f6;"><span style="color:#6b7280;">{k}</span><span style="color:#1f2937;font-weight:500;">{v}</span></div>' for k, v in specs.items()])
+            specs_html = f'<div style="margin-top:16px;"><h4 style="margin:0 0 12px 0;color:#374151;font-size:14px;font-weight:600;">Especificaciones</h4><div style="font-size:13px;">{specs_items}</div></div>'
+        
+        html = f'''
+        <div style="margin:10px 0;border-radius:16px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.1);">
+            <div style="display:grid;grid-template-columns:1fr 1.5fr;min-height:350px;">
+                <div style="position:relative;background:linear-gradient(135deg,#f8fafc,#e5e7eb);">
+                    <img src="{image_url}" alt="{product.get("name")}" style="width:100%;height:100%;object-fit:cover;">
+                    <span style="position:absolute;top:12px;left:12px;background:rgba(79,70,229,0.95);color:white;font-size:11px;font-weight:600;padding:6px 12px;border-radius:20px;">{product.get("category", "")}</span>
+                </div>
+                <div style="padding:24px;background:white;display:flex;flex-direction:column;">
+                    <div style="font-size:11px;color:#9ca3af;font-family:monospace;margin-bottom:8px;">{sku}</div>
+                    <h3 style="margin:0 0 12px 0;color:#1f2937;font-size:22px;font-weight:700;line-height:1.3;">{product.get("name")}</h3>
+                    <p style="margin:0 0 16px 0;color:#6b7280;font-size:14px;line-height:1.6;flex:1;">{product.get("description", "Sin descripcion disponible")}</p>
+                    {specs_html}
+                    <div style="margin-top:auto;padding-top:16px;border-top:1px solid #e5e7eb;">
+                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
+                            <div>
+                                <div style="font-size:32px;font-weight:700;color:#059669;">${product.get("price", 0):,.2f}</div>
+                                <div style="margin-top:4px;">{stock_status}</div>
+                            </div>
+                        </div>
+                        <button class="add-btn" data-code="{sku}" data-sku="{sku}" style="width:100%;background:linear-gradient(135deg,#4F46E5,#6366f1);color:white;border:none;padding:14px 24px;border-radius:12px;font-size:15px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;transition:all 0.2s;box-shadow:0 4px 12px rgba(79,70,229,0.3);" onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 6px 20px rgba(79,70,229,0.4)'" onmouseout="this.style.transform='translateY(0)';this.style.boxShadow='0 4px 12px rgba(79,70,229,0.3)'">
+                            <span style="font-size:20px;">+</span> Agregar al Carrito
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        '''
+        
+        return json.dumps({
+            "success": True,
+            "product_id": product_id,
+            "product_name": product.get("name"),
+            "price": product.get("price", 0),
+            "stock": available_stock,
+            "html": html
         })
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)})
@@ -1068,35 +1335,21 @@ async def create_budget_proposal(budget: float, room_type: str = "general") -> s
                 seen_ids.add(pid)
                 unique_products.append(p)
         
-        unique_products.sort(key=lambda x: x.get("price", 0))
+        # Sort by price DESCENDING to prioritize higher-value items and use more budget
+        unique_products.sort(key=lambda x: x.get("price", 0), reverse=True)
         
         proposal = []
         total = 0
         remaining = budget
         categories_covered = set()
+        added_ids = set()
         
+        # First pass: Add one product per category (prioritize higher-priced items)
         for product in unique_products:
             price = product.get("price", 0)
             category = product.get("category", "").lower()
-            if price <= remaining and category not in categories_covered:
-                proposal.append({
-                    "product_id": product.get("product_id") or product.get("id"),
-                    "name": product.get("name", ""),
-                    "category": product.get("category", ""),
-                    "price": price,
-                    "sku": product.get("sku", ""),
-                    "stock": product.get("stock", 0)
-                })
-                total += price
-                remaining -= price
-                categories_covered.add(category)
-        
-        for product in unique_products:
-            price = product.get("price", 0)
             pid = product.get("product_id") or product.get("id")
-            if any(p["product_id"] == pid for p in proposal):
-                continue
-            if price <= remaining and len(proposal) < 10:
+            if price <= remaining and category not in categories_covered and pid not in added_ids:
                 proposal.append({
                     "product_id": pid,
                     "name": product.get("name", ""),
@@ -1107,6 +1360,33 @@ async def create_budget_proposal(budget: float, room_type: str = "general") -> s
                 })
                 total += price
                 remaining -= price
+                categories_covered.add(category)
+                added_ids.add(pid)
+        
+        # Second pass: Fill remaining budget with more products (up to 15 items, target 85% budget use)
+        target_min = budget * 0.85
+        for product in unique_products:
+            if total >= target_min or len(proposal) >= 15:
+                break
+            price = product.get("price", 0)
+            pid = product.get("product_id") or product.get("id")
+            if pid in added_ids:
+                continue
+            if price <= remaining:
+                proposal.append({
+                    "product_id": pid,
+                    "name": product.get("name", ""),
+                    "category": product.get("category", ""),
+                    "price": price,
+                    "sku": product.get("sku", ""),
+                    "stock": product.get("stock", 0)
+                })
+                total += price
+                remaining -= price
+                added_ids.add(pid)
+        
+        # Sort proposal by price descending for display
+        proposal.sort(key=lambda x: x.get("price", 0), reverse=True)
         
         if not proposal:
             return json.dumps({"success": False, "error": f"No encontre productos dentro de tu presupuesto de ${budget:,.2f}"})
@@ -1139,39 +1419,50 @@ async def create_budget_proposal(budget: float, room_type: str = "general") -> s
             print(f"[PRODUCTS] Failed to save to Redis: {e}")
         
         r2_service = get_r2_service()
+        placeholder_img = "https://img.freepik.com/vector-premium/vector-icono-imagen-predeterminado-pagina-imagen-faltante-diseno-sitio-web-o-aplicacion-movil-no-hay-foto-disponible_87543-11093.jpg"
         cards = []
         for idx, p in enumerate(proposal, 1):
+            sku = p.get("sku", "N/A")
             try:
                 image_key = f"products/{p['product_id']}.jpg"
-                image_url = r2_service.get_signed_url(image_key) if r2_service else ""
+                image_url = r2_service.get_signed_url(image_key) if r2_service else placeholder_img
             except:
-                image_url = ""
-            img_html = f'<img src="{image_url}" style="width:60px;height:60px;object-fit:cover;border-radius:8px;">' if image_url else '<div style="width:60px;height:60px;background:#e5e7eb;border-radius:8px;"></div>'
+                image_url = placeholder_img
+            
             cards.append(f'''
-            <div class="product-card" data-index="{idx}" style="display:flex;gap:10px;padding:10px;background:white;border-radius:10px;border:1px solid #e5e7eb;margin-bottom:8px;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.borderColor='#4F46E5'" onmouseout="this.style.borderColor='#e5e7eb'">
-                <div style="flex-shrink:0;">{img_html}</div>
-                <div style="flex:1;min-width:0;">
-                    <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;">
-                        <span style="background:#4F46E5;color:white;font-size:10px;font-weight:bold;padding:2px 6px;border-radius:8px;">#{idx}</span>
-                        <span style="font-size:9px;color:#6b7280;background:#f3f4f6;padding:2px 4px;border-radius:3px;">{p["category"]}</span>
-                    </div>
-                    <div style="font-weight:600;color:#1f2937;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{p["name"]}</div>
-                    <div style="font-size:16px;font-weight:bold;color:#059669;">${p["price"]:,.2f}</div>
+            <div class="product-card" data-code="{sku}" data-sku="{sku}" data-index="{idx}" style="background:white;border-radius:12px;border:1px solid #e5e7eb;overflow:hidden;transition:all 0.3s ease;display:flex;flex-direction:column;" onmouseover="this.style.transform='translateY(-4px)';this.style.boxShadow='0 12px 24px rgba(0,0,0,0.12)';this.style.borderColor='#4F46E5'" onmouseout="this.style.transform='translateY(0)';this.style.boxShadow='none';this.style.borderColor='#e5e7eb'">
+                <div style="position:relative;">
+                    <img src="{image_url}" onerror="this.src='{placeholder_img}'" style="width:100%;height:160px;object-fit:cover;">
+                    <span style="position:absolute;top:8px;left:8px;background:rgba(79,70,229,0.95);color:white;font-size:10px;font-weight:600;padding:4px 10px;border-radius:20px;">{p["category"]}</span>
                 </div>
-                <button class="add-btn" data-index="{idx}" style="align-self:center;background:#4F46E5;color:white;border:none;padding:6px 12px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;" onmouseover="this.style.background='#4338ca'" onmouseout="this.style.background='#4F46E5'">+ Agregar</button>
+                <div style="padding:14px;flex:1;display:flex;flex-direction:column;">
+                    <div style="font-weight:600;color:#1f2937;font-size:14px;margin-bottom:6px;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:40px;">{p["name"]}</div>
+                    <div style="font-size:10px;color:#9ca3af;margin-bottom:10px;font-family:monospace;">{sku}</div>
+                    <div style="margin-top:auto;">
+                        <div style="font-size:22px;font-weight:700;color:#059669;margin-bottom:10px;">${p["price"]:,.2f}</div>
+                        <button class="add-btn" data-code="{sku}" data-sku="{sku}" data-index="{idx}" style="width:100%;background:linear-gradient(135deg,#4F46E5,#6366f1);color:white;border:none;padding:10px;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:all 0.2s;" onmouseover="this.style.transform='scale(1.02)';this.style.boxShadow='0 4px 12px rgba(79,70,229,0.4)'" onmouseout="this.style.transform='scale(1)';this.style.boxShadow='none'">
+                            <span style="font-size:16px;">+</span> Agregar al Carrito
+                        </button>
+                    </div>
+                </div>
             </div>''')
         
         html = f'''
-        <div style="margin:10px 0;border:2px solid #4F46E5;border-radius:12px;padding:15px;background:#f8fafc;">
-            <h3 style="color:#4F46E5;margin:0 0 5px 0;">Propuesta para tu Presupuesto</h3>
-            <p style="color:#666;font-size:12px;margin:0 0 15px 0;">Presupuesto: <strong>${budget:,.2f}</strong> | Ambiente: <strong>{room_type.title()}</strong></p>
-            <div style="max-height:400px;overflow-y:auto;">{"".join(cards)}</div>
-            <div style="display:flex;justify-content:space-between;align-items:center;padding:12px;background:#059669;border-radius:8px;margin-top:12px;">
+        <div style="margin:10px 0;">
+            <div style="background:linear-gradient(135deg,#4F46E5,#6366f1);border-radius:12px 12px 0 0;padding:16px 20px;">
+                <h3 style="color:white;margin:0 0 4px 0;font-size:18px;font-weight:700;">Propuesta Personalizada</h3>
+                <p style="color:rgba(255,255,255,0.8);font-size:13px;margin:0;">Presupuesto: <strong style="color:white;">${budget:,.2f}</strong> | Ambiente: <strong style="color:white;">{room_type.title()}</strong></p>
+            </div>
+            <div style="background:#f8fafc;padding:20px;border:1px solid #e5e7eb;border-top:none;">
+                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;">{"".join(cards)}</div>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;background:linear-gradient(135deg,#059669,#10b981);border-radius:0 0 12px 12px;">
                 <div>
-                    <div style="color:white;font-size:12px;">TOTAL: <strong style="font-size:18px;">${total:,.2f}</strong></div>
-                    <div style="color:#bbf7d0;font-size:11px;">Te sobran: ${remaining:,.2f}</div>
+                    <div style="color:rgba(255,255,255,0.8);font-size:12px;margin-bottom:2px;">TOTAL DE LA PROPUESTA</div>
+                    <div style="color:white;font-size:24px;font-weight:700;">${total:,.2f}</div>
+                    <div style="color:#bbf7d0;font-size:12px;">Disponible: ${remaining:,.2f}</div>
                 </div>
-                <button class="add-all-btn" style="background:white;color:#059669;border:none;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:bold;cursor:pointer;transition:all 0.2s;" onmouseover="this.style.background='#f0fdf4'" onmouseout="this.style.background='white'">Agregar Todo al Carrito</button>
+                <button class="add-all-btn" style="background:white;color:#059669;border:none;padding:14px 28px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;transition:all 0.2s;box-shadow:0 4px 12px rgba(0,0,0,0.15);" onmouseover="this.style.transform='scale(1.05)';this.style.boxShadow='0 6px 20px rgba(0,0,0,0.2)'" onmouseout="this.style.transform='scale(1)';this.style.boxShadow='0 4px 12px rgba(0,0,0,0.15)'">Agregar Todo al Carrito</button>
             </div>
         </div>'''
         
@@ -1317,14 +1608,30 @@ async def get_cross_sell_recommendations(product_id: str = "") -> str:
         
         # Get base product category
         base_product = None
+        
+        # First try to resolve product_id if provided (could be UUID or code like A1)
         if product_id:
-            base_product = await db.products.find_one({"product_id": product_id})
-        elif cart.get("items"):
+            # Try as UUID first
+            base_product = await db.products.find_one({"id": product_id})
+            if not base_product:
+                base_product = await db.products.find_one({"product_id": product_id})
+            
+            # If not found and looks like a code (A1, B2), try to resolve from session
+            if not base_product and product_id:
+                resolved_id = await _resolve_product_id(conversation_id, product_id)
+                if resolved_id:
+                    base_product = await db.products.find_one({"id": resolved_id})
+        
+        # Fallback to last item in cart
+        if not base_product and cart.get("items"):
             last_item = cart["items"][-1]
-            base_product = await db.products.find_one({"product_id": last_item["product_id"]})
+            pid = last_item.get("product_id") or last_item.get("id")
+            base_product = await db.products.find_one({"id": pid})
+            if not base_product:
+                base_product = await db.products.find_one({"product_id": pid})
         
         if not base_product:
-            return json.dumps({"success": False, "error": "No se encontro producto base"})
+            return json.dumps({"success": False, "error": "No se encontro producto base. Asegurate de tener productos en el carrito."})
         
         # Cross-sell mapping by category
         cross_sell_map = {
@@ -1343,45 +1650,91 @@ async def get_cross_sell_recommendations(product_id: str = "") -> str:
         
         # Search for complementary products
         recommendations = []
+        base_product_id = base_product.get("id") or base_product.get("product_id")
+        
         for cat in related_categories[:2]:
-            results = await pinecone_store.search_products(cat, top_k=3)
+            results = await pinecone_store.search_products(cat, top_k=5)
             for p in results:
-                if p.get("stock", 0) > 0 and p.get("product_id") != base_product.get("product_id"):
-                    # Add simulated rating
-                    rating = round(random.uniform(4.2, 4.9), 1)
-                    reviews = random.randint(50, 300)
-                    recommendations.append({
-                        "product_id": p.get("product_id") or p.get("id"),
-                        "name": p.get("name"),
-                        "category": p.get("category"),
-                        "price": p.get("price"),
-                        "stock": p.get("stock"),
-                        "rating": rating,
-                        "reviews": reviews,
-                        "reason": f"Combina perfecto con tu {base_product.get('name', 'producto')}"
-                    })
-                    if len(recommendations) >= 3:
-                        break
+                pid = p.get("id") or p.get("product_id")
+                # Skip the base product
+                if pid == base_product_id:
+                    continue
+                
+                # Get full product info from DB to check stock
+                full_product = await db.products.find_one({"id": pid})
+                if not full_product:
+                    continue
+                
+                stock = full_product.get("stock", 0)
+                if stock <= 0:
+                    continue
+                
+                # Add simulated rating
+                rating = round(random.uniform(4.2, 4.9), 1)
+                reviews = random.randint(50, 300)
+                recommendations.append({
+                    "product_id": pid,
+                    "name": full_product.get("name"),
+                    "category": full_product.get("category"),
+                    "price": full_product.get("price"),
+                    "stock": stock,
+                    "rating": rating,
+                    "reviews": reviews,
+                    "reason": f"Combina perfecto con tu {base_product.get('name', 'producto')}"
+                })
+                if len(recommendations) >= 3:
+                    break
             if len(recommendations) >= 3:
                 break
         
         if not recommendations:
             return json.dumps({"success": True, "recommendations": [], "message": "No hay recomendaciones disponibles"})
         
-        # Generate HTML
+        # Generate HTML with grid layout
         r2_service = get_r2_service()
-        rows = []
+        placeholder_img = "https://img.freepik.com/vector-premium/vector-icono-imagen-predeterminado-pagina-imagen-faltante-diseno-sitio-web-o-aplicacion-movil-no-hay-foto-disponible_87543-11093.jpg"
+        cards = []
         for idx, p in enumerate(recommendations, 1):
+            sku = p.get("sku", "N/A")
             try:
-                image_url = r2_service.get_signed_url(f"products/{p['product_id']}.jpg") if r2_service else ""
+                image_url = r2_service.get_signed_url(f"products/{p['product_id']}.jpg") if r2_service else placeholder_img
             except:
-                image_url = ""
-            img_html = f'<img src="{image_url}" style="width:40px;height:40px;object-fit:cover;border-radius:4px;">' if image_url else ""
+                image_url = placeholder_img
             stars = "★" * int(p["rating"]) + "☆" * (5 - int(p["rating"]))
-            stock_badge = '<span style="color:#dc2626;font-size:10px;">¡Ultimas unidades!</span>' if p["stock"] < 10 else ""
-            rows.append(f'<tr style="border-bottom:1px solid #eee;"><td style="padding:8px;">{img_html}</td><td style="padding:8px;"><strong>{p["name"]}</strong><br><span style="color:#f59e0b;font-size:11px;">{stars}</span> <span style="font-size:10px;color:#666;">({p["reviews"]} reseñas)</span><br>{stock_badge}</td><td style="padding:8px;text-align:right;font-weight:bold;color:#059669;">${p["price"]:,.2f}</td></tr>')
+            stock_badge = f'<span style="color:#dc2626;font-size:9px;font-weight:600;">Solo {p["stock"]} disponibles</span>' if p["stock"] < 10 else f'<span style="color:#059669;font-size:9px;">{p["stock"]} disponibles</span>'
+            
+            cards.append(f'''
+            <div class="product-card" data-code="{sku}" data-sku="{sku}" style="background:white;border-radius:12px;border:1px solid #fcd34d;overflow:hidden;transition:all 0.3s ease;display:flex;flex-direction:column;" onmouseover="this.style.transform='translateY(-4px)';this.style.boxShadow='0 12px 24px rgba(245,158,11,0.2)';this.style.borderColor='#f59e0b'" onmouseout="this.style.transform='translateY(0)';this.style.boxShadow='none';this.style.borderColor='#fcd34d'">
+                <div style="position:relative;">
+                    <img src="{image_url}" onerror="this.src='{placeholder_img}'" style="width:100%;height:140px;object-fit:cover;">
+                    <span style="position:absolute;top:8px;right:8px;background:#f59e0b;color:white;font-size:9px;font-weight:600;padding:3px 8px;border-radius:12px;">Recomendado</span>
+                </div>
+                <div style="padding:12px;flex:1;display:flex;flex-direction:column;">
+                    <div style="font-weight:600;color:#1f2937;font-size:13px;margin-bottom:4px;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:34px;">{p["name"]}</div>
+                    <div style="color:#f59e0b;font-size:11px;margin-bottom:4px;">{stars} <span style="color:#666;font-size:10px;">({p["reviews"]})</span></div>
+                    <div style="font-size:9px;color:#9ca3af;margin-bottom:6px;font-family:monospace;">{sku}</div>
+                    <div style="margin-top:auto;">
+                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                            <span style="font-size:18px;font-weight:700;color:#059669;">${p["price"]:,.2f}</span>
+                            {stock_badge}
+                        </div>
+                        <button class="add-btn" data-code="{sku}" data-sku="{sku}" style="width:100%;background:linear-gradient(135deg,#f59e0b,#fbbf24);color:white;border:none;padding:8px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:4px;transition:all 0.2s;" onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'">
+                            <span style="font-size:14px;">+</span> Agregar
+                        </button>
+                    </div>
+                </div>
+            </div>''')
         
-        html = f'<div style="margin:10px 0;border:2px solid #f59e0b;border-radius:12px;padding:15px;background:#fffbeb;"><h4 style="color:#d97706;margin:0 0 10px 0;">Clientes que compraron esto tambien llevaron:</h4><table style="width:100%;border-collapse:collapse;font-size:13px;">{"".join(rows)}</table><p style="font-size:11px;color:#666;margin-top:10px;">¿Te gustaria agregar alguno? Solo dime cual.</p></div>'
+        html = f'''
+        <div style="margin:10px 0;">
+            <div style="background:linear-gradient(135deg,#f59e0b,#fbbf24);border-radius:12px 12px 0 0;padding:14px 18px;">
+                <h4 style="color:white;margin:0;font-size:15px;font-weight:700;">Clientes que compraron esto tambien llevaron</h4>
+            </div>
+            <div style="background:#fffbeb;padding:16px;border:1px solid #fcd34d;border-top:none;border-radius:0 0 12px 12px;">
+                <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;">{"".join(cards)}</div>
+                <p style="font-size:12px;color:#92400e;margin:14px 0 0 0;text-align:center;">Haz clic en "Agregar" o dime cual te interesa</p>
+            </div>
+        </div>'''
         
         return json.dumps({"success": True, "recommendations": recommendations, "html_table": html, "base_product": base_product.get("name")})
     except Exception as e:
@@ -2228,6 +2581,7 @@ async def cancel_order(order_number: str, total_amount: float, reason: str = "")
 SALES_TOOLS = [
     search_products,
     check_stock,
+    get_product_details,
     add_to_cart,
     update_cart_quantity,
     remove_product_from_cart,
@@ -2278,12 +2632,29 @@ def get_system_prompt(user_context: Dict, cart_summary: str) -> str:
     """Generate system prompt for the sales agent"""
     return f"""Eres Taylor, una asistente de ventas experta para articulos del hogar.
 
-**Personalidad:** Calida, profesional, orientada a soluciones.
+**Personalidad:** Calida, profesional, orientada a soluciones. Hablas en primera persona correctamente (yo busco, yo te muestro, yo te recomiendo).
+
+**REGLA CRITICA - CONTEXTO DE CONVERSACION:**
+SIEMPRE recuerda lo que el cliente pidio antes. Si el cliente pregunto por "ollas" y luego dice "maximo 400 dolares", 
+debes buscar OLLAS con ese presupuesto, NO cambiar de tema.
+
+Ejemplos de mantener contexto:
+- Cliente: "tienes ollas?" -> Tu: preguntas preferencias
+- Cliente: "maximo 400 dolares" -> search_products(query="ollas", max_price=400) <- USA EL CONTEXTO ANTERIOR
+- Cliente: "busco espejos" -> Tu: muestras espejos
+- Cliente: "pero mas baratos, hasta 200" -> search_products(query="espejos", max_price=200)
+
+**REGLA CRITICA - SER DIRECTO:**
+NO hagas demasiadas preguntas. Cuando el cliente pide algo, MUESTRA OPCIONES INMEDIATAMENTE.
+- "tienes ollas?" -> search_products("ollas") y muestra 5 opciones
+- "busco lamparas" -> search_products("lamparas") y muestra opciones
+- NO preguntes "que tipo?", "que material?", "que presupuesto?" - solo muestra opciones y el cliente afina despues.
 
 **Herramientas Disponibles:**
-- search_products: Buscar productos en el catalogo
+- search_products: Buscar productos en el catalogo (opcionalmente con presupuesto maximo)
 - check_stock: Verificar stock de un producto
-- add_to_cart: Agregar producto al carrito (SOLO con numero # o SKU exacto)
+- get_product_details: Ver detalles completos de un producto (descripcion, especificaciones, imagen grande)
+- add_to_cart: Agregar producto al carrito (usa el CODIGO como A1, B2, etc.)
 - update_cart_quantity: Cambiar cantidad de un producto en el carrito
 - remove_product_from_cart: Eliminar un producto del carrito
 - clear_cart: Vaciar todo el carrito
@@ -2306,25 +2677,50 @@ def get_system_prompt(user_context: Dict, cart_summary: str) -> str:
 - offer_financing: Mostrar opciones de pago en cuotas
 - offer_extended_warranty: Ofrecer garantia extendida
 
-**REGLA CRITICA - add_to_cart SOLO CON NUMERO O SKU:**
+**REGLA CRITICA - CODIGOS DE PRODUCTOS (A1, B2, etc.):**
 
-Cuando uses add_to_cart, SIEMPRE pasa el NUMERO de la tabla (1, 2, 3...) o el SKU EXACTO.
-NUNCA pases nombres de productos ni descripciones.
+Los productos se identifican con CODIGOS unicos: letra de busqueda + numero (A1, A2, B1, B2, etc.)
+- Cada busqueda genera una nueva letra (A, B, C...)
+- Esto evita confusiones cuando hay multiples busquedas
 
-Ejemplos CORRECTOS de add_to_cart:
-- Cliente dice "quiero el primero" -> add_to_cart(product_id="1", quantity=1)
-- Cliente dice "dame el #2" -> add_to_cart(product_id="2", quantity=1)
-- Cliente dice "quiero 2 del tercero" -> add_to_cart(product_id="3", quantity=2)
-- Cliente dice "agrega el ESPEJO-BANO-LED" -> add_to_cart(product_id="ESPEJO-BANO-LED", quantity=1)
+Ejemplos CORRECTOS:
+- Cliente dice "quiero el A1" -> add_to_cart(product_id="A1", quantity=1)
+- Cliente dice "dame el B2" -> add_to_cart(product_id="B2", quantity=1)
+- Cliente dice "detalles del A3" -> get_product_details(product_code="A3")
+- Cliente dice "quiero 2 del C1" -> add_to_cart(product_id="C1", quantity=2)
+
+Si el cliente solo dice un numero (1, 2, 3), usa el de la ULTIMA busqueda mostrada.
 
 Ejemplos INCORRECTOS (NUNCA hagas esto):
-- add_to_cart(product_id="espejo de baño", quantity=1) <- MAL, usa el numero
-- add_to_cart(product_id="Espejo Decorativo", quantity=1) <- MAL, usa el numero
-- add_to_cart(product_id="el espejo", quantity=1) <- MAL, usa el numero
+- add_to_cart(product_id="espejo de baño", quantity=1) <- MAL, usa el codigo
+- add_to_cart(product_id="Espejo Decorativo", quantity=1) <- MAL, usa el codigo
 
-**REGLA CRITICA - SIEMPRE MOSTRAR OPCIONES PRIMERO:**
+**VER DETALLES DE PRODUCTO:**
+- "muestrame detalles del A1" -> get_product_details(product_code="A1")
+- "quiero ver mas info del B2" -> get_product_details(product_code="B2")
 
-NUNCA agregues productos al carrito automaticamente. SIEMPRE usa search_products primero para mostrar opciones al cliente.
+**BUSQUEDA CON PRESUPUESTO:**
+Cuando el cliente menciona un presupuesto, usa max_price para filtrar. RECUERDA EL PRODUCTO DEL CONTEXTO:
+- "quiero espejos y tengo 500 dolares" -> search_products(query="espejos", max_price=500)
+- "busco lamparas con presupuesto de 200" -> search_products(query="lamparas", max_price=200)
+- "mesas hasta 1000 dolares" -> search_products(query="mesas", max_price=1000)
+- Si antes pregunto por "ollas" y ahora dice "maximo 400" -> search_products(query="ollas", max_price=400)
+- Si antes pregunto por "espejos" y ahora dice "hasta 300" -> search_products(query="espejos", max_price=300)
+
+Los productos se ordenaran del mas caro al mas barato dentro del presupuesto.
+
+**REGLA CRITICA - MOSTRAR OPCIONES INMEDIATAMENTE:**
+
+Cuando el cliente pregunta por un producto, USA search_products INMEDIATAMENTE. NO hagas preguntas primero.
+
+CORRECTO:
+- "tienes ollas?" -> search_products("ollas") <- BUSCA INMEDIATAMENTE
+- "quiero una cama" -> search_products("cama") <- BUSCA INMEDIATAMENTE
+- "busco lamparas" -> search_products("lamparas") <- BUSCA INMEDIATAMENTE
+
+INCORRECTO (NO hagas esto):
+- "tienes ollas?" -> "Que tipo de ollas buscas?" <- MAL, no preguntes, busca
+- "quiero espejos" -> "Tienes algun presupuesto?" <- MAL, muestra opciones primero
 
 Ejemplos:
 - "quiero una cama" -> search_products("cama") -> mostrar opciones -> cliente elige -> add_to_cart
@@ -2351,9 +2747,15 @@ El flujo SIEMPRE es: Buscar -> Mostrar opciones -> Cliente elige -> Agregar al c
 10. Cuando tenga TODOS los datos -> create_order(...)
 
 **CRITICO - Agregar al Carrito:**
-- Cuando el cliente dice "quiero el 1" o "agrega el edredon" -> USA add_to_cart INMEDIATAMENTE
+- Cuando el cliente dice "quiero el 1", "agrega el A1", "agrega el producto B1" -> USA add_to_cart INMEDIATAMENTE
 - NO pidas confirmacion, NO preguntes "confirmo que agregue?", simplemente AGREGALO
-- Si el cliente ya vio productos y dice un numero o nombre, AGREGALO sin volver a buscar
+- Si el cliente ya vio productos y dice un numero o codigo, AGREGALO sin volver a buscar
+- SIEMPRE ejecuta add_to_cart cuando el cliente pide agregar algo, NUNCA respondas sin ejecutar la herramienta
+- Ejemplos que REQUIEREN add_to_cart:
+  * "agrega el producto A1" -> add_to_cart(product_id="A1", quantity=1)
+  * "agrega el B2 al carrito" -> add_to_cart(product_id="B2", quantity=1)
+  * "quiero el 1" -> add_to_cart(product_id="1", quantity=1)
+  * "dame 2 del A3" -> add_to_cart(product_id="A3", quantity=2)
 
 **CRITICO - Seleccion de Horario:**
 La tabla muestra dias como filas (A=primer dia, B=segundo, etc.) y horas como columnas (1=09-12h, 2=12-15h, 3=15-18h, 4=18-21h).
@@ -2395,9 +2797,31 @@ Actua como un vendedor real que quiere retener la venta:
 - NUNCA solo digas "listo, eliminado" - siempre intenta recuperar la venta
 - Muestra el boton de "Agregar con 5% descuento" que viene en el HTML de la respuesta
 
+**REGLA CRITICA - RESPONDER TODAS LAS PREGUNTAS:**
+Cuando el cliente hace multiples preguntas o solicitudes en un mensaje, DEBES responder TODAS:
+- Si pide un paquete Y pregunta sobre descuentos -> Genera el paquete Y responde sobre los descuentos
+- Si pregunta "puedes armarme un paquete? el descuento aplicaria?" -> Genera propuesta Y confirma si el descuento aplica
+- NUNCA ignores una pregunta del cliente, aunque sea secundaria
+- Actua como vendedor real: responde TODO lo que el cliente pregunta para cerrar la venta
+
+Ejemplo:
+- Cliente: "tengo 5000 usd, armame un paquete, el descuento del 12% aplica?"
+- Tu respuesta DEBE incluir:
+  1. La propuesta de presupuesto (create_budget_proposal)
+  2. Confirmacion sobre el descuento: "Si, el descuento del 12% aplica a toda tu compra incluyendo este paquete"
+
 **PRESUPUESTO:**
 - "tengo X dolares para amoblar" -> create_budget_proposal(budget=X, room_type="general")
 - "presupuesto de X para la sala" -> create_budget_proposal(budget=X, room_type="sala")
+- "agregar toda la propuesta" / "agregar todo al carrito" / "quiero toda la propuesta" -> add_budget_proposal_to_cart()
+- Cuando el cliente acepta la propuesta completa -> add_budget_proposal_to_cart() (NO uses add_to_cart para cada producto)
+
+**CRITICO - PROPUESTAS DE PRESUPUESTO:**
+Cuando ya mostraste una propuesta con create_budget_proposal y el cliente dice:
+- "agregar todo" / "quiero todo" / "agregar toda la propuesta" / "me llevo todo" / "acepto la propuesta"
+-> USA add_budget_proposal_to_cart() INMEDIATAMENTE
+-> NO pidas el presupuesto de nuevo, ya lo tienes guardado
+-> NO uses add_to_cart para cada producto individual
 
 **CUPONES Y DESCUENTOS:**
 - Preguntas por descuentos -> get_available_coupons()
@@ -2453,6 +2877,13 @@ async def sales_agent_node_v3(state: AgentState) -> AgentState:
         print(f"\n[AGENT] Inyectando resumen de memoria ({len(conversation_summary)} chars)")
         print(f"[AGENT] Resumen: {conversation_summary[:200]}...")
     
+    # Get orchestrator intervention if any
+    orchestrator_intervention = state.get("orchestrator_intervention")
+    conversation_stage = state.get("conversation_stage", "discovery")
+    
+    if orchestrator_intervention:
+        print(f"\n[AGENT] Orchestrator intervention: {orchestrator_intervention[:100]}...")
+    
     try:
         # Get LLM with tools bound
         llm = get_llm()
@@ -2460,6 +2891,22 @@ async def sales_agent_node_v3(state: AgentState) -> AgentState:
         
         # Build messages for LLM
         system_prompt = get_system_prompt(user_context, cart_summary)
+        
+        # Inject conversation stage context with specific behavior (guidance, not restrictions)
+        stage_behaviors = {
+            "discovery": "DESCUBRIMIENTO - Si el cliente menciona presupuesto, usa create_budget_proposal. Si no, haz 1-2 preguntas breves.",
+            "proposal": "PROPUESTA - Muestra opciones. Destaca 1 opción principal y menciona alternativas.",
+            "optimization": "OPTIMIZACIÓN - El cliente ajusta. Ofrece alternativas o descuentos si duda.",
+            "commitment": "COMPROMISO - Agrega productos inmediatamente. Sugiere cross-sell después.",
+            "checkout": "CHECKOUT - Guía hacia la compra. Pide datos y muestra horarios.",
+            "completed": "COMPLETADO - Agradece y ofrece ayuda adicional."
+        }
+        stage_behavior = stage_behaviors.get(conversation_stage, stage_behaviors["discovery"])
+        system_prompt += f"\n\n**ETAPA:** {conversation_stage.upper()} - {stage_behavior}"
+        
+        # Inject orchestrator guidance if exists
+        if orchestrator_intervention:
+            system_prompt += f"\n\n**GUÍA DEL ORQUESTADOR (incorpora esto en tu respuesta de forma natural):**\n{orchestrator_intervention}"
         
         # Inject conversation summary if exists
         if conversation_summary:
@@ -2469,7 +2916,20 @@ async def sales_agent_node_v3(state: AgentState) -> AgentState:
         
         # Add recent conversation messages (limit to last 10)
         recent_messages = messages[-10:] if len(messages) > 10 else messages
-        print(f"[AGENT] Enviando {len(recent_messages)} mensajes recientes al LLM")
+        print(f"\n{'='*60}")
+        print(f"[AGENT] CONTEXTO DE CONVERSACION - {conversation_id}")
+        print(f"[AGENT] Total mensajes en state: {len(messages)}")
+        print(f"[AGENT] Mensajes recientes a enviar: {len(recent_messages)}")
+        print(f"{'='*60}")
+        
+        for i, msg in enumerate(recent_messages):
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            preview = content[:150] + "..." if len(content) > 150 else content
+            print(f"[AGENT] Msg {i+1} [{role}]: {preview}")
+        
+        print(f"{'='*60}\n")
+        
         for msg in recent_messages:
             content = msg.get("content", "")
             if content and len(content) > 2000:
@@ -2595,8 +3055,16 @@ async def sales_agent_node_v3(state: AgentState) -> AgentState:
                     final_message = llm_response
             else:
                 final_message = llm_response
+            
+            # Ensure we always have a response
+            if not final_message or final_message.strip() == "":
+                print(f"[AGENT] WARNING: Empty response after tool calls. Tool results: {tool_results}")
+                final_message = "Entendido. ¿En qué más puedo ayudarte?"
         else:
             final_message = response.content or ""
+            if not final_message or final_message.strip() == "":
+                print(f"[AGENT] WARNING: Empty response from LLM (no tool calls)")
+                final_message = "¿En qué puedo ayudarte?"
         
         # Log final response
         reasoning_steps.append({
@@ -2611,9 +3079,12 @@ async def sales_agent_node_v3(state: AgentState) -> AgentState:
         stock_service = get_stock_service()
         cart_items = await stock_service.get_cart(conversation_id)
         
+        # Return ONLY the new assistant message - the reducer will append it to existing messages
+        new_message = {"role": "assistant", "content": final_message, "timestamp": datetime.utcnow().isoformat()}
+        
         return {
             **state,
-            "messages": [{"role": "assistant", "content": final_message}],
+            "messages": [new_message],
             "reasoning_trace": reasoning_steps,
             "cart": cart_items,
             "current_node": "sales_agent",
@@ -2630,9 +3101,12 @@ async def sales_agent_node_v3(state: AgentState) -> AgentState:
             "result": {"error": str(e)}
         })
         
+        # Return ONLY the new error message - the reducer will append it
+        error_msg = {"role": "assistant", "content": "Lo siento, ocurrio un error. Por favor intenta de nuevo.", "timestamp": datetime.utcnow().isoformat()}
+        
         return {
             **state,
-            "messages": [{"role": "assistant", "content": "Lo siento, ocurrio un error. Por favor intenta de nuevo."}],
+            "messages": [error_msg],
             "reasoning_trace": reasoning_steps,
             "current_node": "sales_agent",
             "next_node": "memory_optimizer"

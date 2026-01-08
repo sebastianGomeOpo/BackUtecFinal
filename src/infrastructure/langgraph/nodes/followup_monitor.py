@@ -2,6 +2,7 @@
 Follow-up Monitor Agent
 Monitors conversation inactivity and sends follow-up messages
 Random interval between 20-120 seconds
+Now with intelligent context-aware messaging
 """
 import asyncio
 import random
@@ -9,6 +10,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from ...database.mongodb import MongoDB
+from ...services.stock_reservation import get_stock_service
 
 
 class FollowUpMonitor:
@@ -24,19 +26,27 @@ class FollowUpMonitor:
     MAX_FOLLOWUPS = 999  # Unlimited follow-ups
     MAX_DISCOUNT_PERCENT = 20  # Maximum discount cap
     
-    FOLLOWUP_MESSAGES = [
-        "Hola, sigo aqui para ayudarte. Si tienes alguna pregunta sobre los productos o necesitas una recomendacion, con gusto te asesoro.",
-        "Tengo una sorpresa para ti: si confirmas tu compra ahora, te aplico un **5% de descuento** automatico. Es mi forma de agradecerte por elegirnos.",
-        "Veo que aun estas pensando. Te cuento que puedo mejorar tu oferta a un **8% de descuento**. Es una oportunidad que no quiero que te pierdas.",
-        "Quiero que te lleves lo mejor. Por eso, te ofrezco un **10% de descuento** exclusivo solo para ti. Esta oferta es por tiempo limitado.",
-        "Se que a veces necesitamos pensarlo bien. Para ayudarte a decidir, te ofrezco **12% de descuento**. Es un precio especial que no encontraras en otro lado.",
-        "Esta es mi mejor oferta: **15% de descuento**. Realmente quiero que te lleves estos productos a un precio increible.",
-        "Voy a hacer algo especial por ti: **18% de descuento**. Es el maximo que puedo ofrecer y vale la pena aprovecharlo.",
-        "Mi oferta final y la mejor que tengo: **20% de descuento**. No puedo mejorar esto, pero estoy segura de que te encantara tu compra."
-    ]
-    
     # Discount percentages for each follow-up level (0=no discount, then progressive)
     FOLLOWUP_DISCOUNT_LEVELS = [0, 5, 8, 10, 12, 15, 18, 20]
+    
+    # Context-aware message templates
+    MESSAGES_NO_CART = [
+        "Sigo aqui para ayudarte. ¿Que tipo de productos estas buscando hoy? Puedo mostrarte nuestras mejores opciones.",
+        "¿Necesitas ayuda para encontrar algo especifico? Tenemos una gran variedad de productos para el hogar.",
+        "Si me cuentas que espacio quieres decorar o amoblar, puedo armarte una propuesta personalizada.",
+    ]
+    
+    MESSAGES_WITH_CART = [
+        "Veo que tienes {cart_count} producto(s) en tu carrito por ${cart_total:.2f}. ¿Te ayudo a completar tu compra?",
+        "Tengo una sorpresa: si confirmas tu compra ahora, te aplico un **{discount}% de descuento** sobre los ${cart_total:.2f} de tu carrito.",
+        "Tu carrito con {cart_count} producto(s) esta reservado por tiempo limitado. Te ofrezco **{discount}% de descuento** para que no lo pierdas.",
+        "Ultima oportunidad: **{discount}% de descuento** en tu carrito de ${cart_total:.2f}. ¿Procedemos con la compra?",
+    ]
+    
+    MESSAGES_VIEWED_PRODUCTS = [
+        "¿Sigues interesado en los productos que viste? Puedo darte mas detalles o buscar alternativas.",
+        "Si alguno de los productos que te mostre te interesa, puedo agregarlo a tu carrito con un descuento especial.",
+    ]
     
     def __init__(self):
         self._monitoring_tasks: Dict[str, asyncio.Task] = {}
@@ -83,14 +93,14 @@ class FollowUpMonitor:
             del self._followup_callbacks[conversation_id]
     
     async def reset_timer(self, conversation_id: str):
-        """Reset the inactivity timer for a conversation (called when user sends message)"""
+        """Reset the inactivity timer for a conversation (called when assistant responds)"""
         db = self._get_db()
         
         await db.conversation_activity.update_one(
             {"conversation_id": conversation_id},
             {
                 "$set": {
-                    "last_user_message": datetime.utcnow(),
+                    "last_assistant_response": datetime.utcnow(),
                     "updated_at": datetime.utcnow()
                 }
             },
@@ -115,14 +125,14 @@ class FollowUpMonitor:
                 if not activity:
                     continue
                 
-                last_user_message = activity.get("last_user_message")
+                last_assistant_response = activity.get("last_assistant_response")
                 followup_count = activity.get("followup_count", 0)
                 
-                if not last_user_message:
+                if not last_assistant_response:
                     continue
                 
-                # Check if enough time has passed since last user message (minimum threshold)
-                time_since_message = datetime.utcnow() - last_user_message
+                # Check if enough time has passed since last assistant response (minimum threshold)
+                time_since_message = datetime.utcnow() - last_assistant_response
                 
                 if time_since_message.total_seconds() >= self.INACTIVITY_MIN_SECONDS:
                     # Check if we haven't exceeded max follow-ups
@@ -151,17 +161,68 @@ class FollowUpMonitor:
                 print(f"Error monitoring {conversation_id}: {e}")
                 await asyncio.sleep(10)
     
+    async def _get_conversation_context(self, conversation_id: str) -> Dict:
+        """Get conversation context including cart and viewed products"""
+        try:
+            stock_service = get_stock_service()
+            cart = await stock_service.get_cart_total(conversation_id)
+            
+            cart_items = cart.get("items", [])
+            cart_total = cart.get("total", 0)
+            cart_count = len(cart_items)
+            
+            # Get viewed products from Redis
+            db = self._get_db()
+            activity = await db.conversation_activity.find_one({"conversation_id": conversation_id})
+            has_viewed_products = activity.get("has_viewed_products", False) if activity else False
+            
+            return {
+                "has_cart": cart_count > 0,
+                "cart_count": cart_count,
+                "cart_total": cart_total,
+                "cart_items": cart_items,
+                "has_viewed_products": has_viewed_products
+            }
+        except Exception as e:
+            print(f"[FOLLOWUP] Error getting context: {e}")
+            return {"has_cart": False, "cart_count": 0, "cart_total": 0, "cart_items": [], "has_viewed_products": False}
+    
     async def _send_followup(self, conversation_id: str, followup_index: int):
-        """Send a follow-up message with progressive discount offers"""
-        # Cap the index to the last message/discount level (max 20%)
-        capped_index = min(followup_index, len(self.FOLLOWUP_MESSAGES) - 1)
-        message = self.FOLLOWUP_MESSAGES[capped_index]
-        discount_percent = self.FOLLOWUP_DISCOUNT_LEVELS[min(capped_index, len(self.FOLLOWUP_DISCOUNT_LEVELS) - 1)]
+        """Send a context-aware follow-up message with progressive discount offers"""
+        # Get conversation context
+        context = await self._get_conversation_context(conversation_id)
         
-        # If we've reached max discount, keep repeating the max offer
-        if followup_index >= len(self.FOLLOWUP_MESSAGES):
+        # Calculate discount based on followup index
+        discount_index = min(followup_index, len(self.FOLLOWUP_DISCOUNT_LEVELS) - 1)
+        discount_percent = self.FOLLOWUP_DISCOUNT_LEVELS[discount_index]
+        
+        # Select message based on context
+        if context["has_cart"]:
+            # Has items in cart - offer discounts
+            msg_index = min(followup_index, len(self.MESSAGES_WITH_CART) - 1)
+            message = self.MESSAGES_WITH_CART[msg_index].format(
+                cart_count=context["cart_count"],
+                cart_total=context["cart_total"],
+                discount=discount_percent if discount_percent > 0 else 5
+            )
+            # Only apply discount if cart has items
+            if discount_percent == 0 and followup_index > 0:
+                discount_percent = 5  # Start with 5% for cart users
+        elif context["has_viewed_products"]:
+            # Viewed products but no cart
+            msg_index = min(followup_index, len(self.MESSAGES_VIEWED_PRODUCTS) - 1)
+            message = self.MESSAGES_VIEWED_PRODUCTS[msg_index]
+            discount_percent = 0  # No discount without cart
+        else:
+            # No cart, no viewed products - just help
+            msg_index = min(followup_index, len(self.MESSAGES_NO_CART) - 1)
+            message = self.MESSAGES_NO_CART[msg_index]
+            discount_percent = 0  # No discount without cart
+        
+        # If max discount reached and has cart, keep offering max
+        if followup_index >= len(self.FOLLOWUP_DISCOUNT_LEVELS) and context["has_cart"]:
             discount_percent = self.MAX_DISCOUNT_PERCENT
-            message = f"Sigo aqui para ayudarte. Recuerda que tienes un **{discount_percent}% de descuento** esperandote. ¿Procedemos con tu compra?"
+            message = f"Sigo aqui para ayudarte. Recuerda que tienes un **{discount_percent}% de descuento** en tu carrito de ${context['cart_total']:.2f}. ¿Procedemos con tu compra?"
         
         db = self._get_db()
         

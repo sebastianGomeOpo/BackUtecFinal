@@ -14,21 +14,29 @@ from .nodes.sales_agent_v3 import sales_agent_node_v3 as sales_agent_node
 from .nodes.reverse_logistics_agent import reverse_logistics_agent_node
 from .nodes.human_node import human_node, process_human_response
 from .nodes.memory_optimizer import memory_optimizer_node
+from .nodes.orchestrator import orchestrator_node
 
 
 def route_after_supervisor(state: AgentState) -> str:
     """
     Route based on supervisor classification and intent detection.
     Supervisor decides which specialized agent should handle the request.
+    Now routes through orchestrator first for proactive guidance.
     """
     if state.get("requires_human") or state.get("classification") == "UNSAFE":
         return "human_node"
     
-    # Check intent for routing to specialized agents
+    # All safe messages go through orchestrator first
+    return "orchestrator"
+
+
+def route_after_orchestrator(state: AgentState) -> str:
+    """
+    Route from orchestrator to the appropriate agent.
+    """
     intent = state.get("intent", "sales")
     if intent == "reverse_logistics":
         return "reverse_logistics_agent"
-    
     return "sales_agent"
 
 
@@ -58,13 +66,14 @@ def route_after_human_node(state: AgentState) -> str:
 
 def create_sales_graph() -> StateGraph:
     """
-    Create the Sales Agent Graph with Supervisor architecture
+    Create the Sales Agent Graph with Supervisor + Orchestrator architecture
     
     Flow:
     1. ContextInjector -> Loads user profile
     2. Supervisor -> Classifies message (SAFE/UNSAFE)
-    3a. If SAFE -> SalesAgent -> MemoryOptimizer -> END
-    3b. If UNSAFE -> HumanNode (interrupt) -> MemoryOptimizer -> END
+    3. Orchestrator -> Analyzes stage, detects hesitation, injects guidance
+    4a. If SAFE -> SalesAgent -> MemoryOptimizer -> END
+    4b. If UNSAFE -> HumanNode (interrupt) -> MemoryOptimizer -> END
     """
     
     # Create graph with state schema
@@ -73,6 +82,7 @@ def create_sales_graph() -> StateGraph:
     # Add nodes
     graph.add_node("context_injector", context_injector_node)
     graph.add_node("supervisor", supervisor_node)
+    graph.add_node("orchestrator", orchestrator_node)
     graph.add_node("sales_agent", sales_agent_node)
     graph.add_node("reverse_logistics_agent", reverse_logistics_agent_node)
     graph.add_node("human_node", human_node)
@@ -84,14 +94,23 @@ def create_sales_graph() -> StateGraph:
     # Add edges
     graph.add_edge("context_injector", "supervisor")
     
-    # Conditional routing after supervisor
+    # Conditional routing after supervisor -> orchestrator or human
     graph.add_conditional_edges(
         "supervisor",
         route_after_supervisor,
         {
-            "sales_agent": "sales_agent",
-            "reverse_logistics_agent": "reverse_logistics_agent",
+            "orchestrator": "orchestrator",
             "human_node": "human_node"
+        }
+    )
+    
+    # Conditional routing after orchestrator -> sales or reverse logistics
+    graph.add_conditional_edges(
+        "orchestrator",
+        route_after_orchestrator,
+        {
+            "sales_agent": "sales_agent",
+            "reverse_logistics_agent": "reverse_logistics_agent"
         }
     )
     
@@ -153,36 +172,46 @@ class SalesGraph:
         )
     
     async def start_conversation(self, user_id: str = "guest") -> Dict[str, Any]:
-        """Start a new conversation"""
+        """Start a new conversation - just initialize state, don't run the full graph"""
         import uuid
         from datetime import datetime
         
         conversation_id = str(uuid.uuid4())[:12]
         
+        # Welcome message
+        welcome_message = {
+            "role": "assistant",
+            "content": "¡Hola! Soy Taylor, tu asistente de ventas. ¿En qué puedo ayudarte hoy?",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
         initial_state: AgentState = {
             "conversation_id": conversation_id,
-            "messages": [],
+            "messages": [welcome_message],
             "user_context": {"user_id": user_id},
             "reasoning_trace": [],
-            "classification": "PENDING",
+            "classification": "SAFE",
             "escalation": None,
             "requires_human": False,
             "cart": [],
-            "message_count": 0,
+            "message_count": 1,
             "compressed_history": None,
-            "current_node": "start",
-            "next_node": "context_injector",
+            "current_node": "memory_optimizer",  # Skip to end - just save initial state
+            "next_node": None,
             "error": None
         }
         
-        # Run context injection
+        # Save initial state to checkpointer without running the full graph
         config = {"configurable": {"thread_id": conversation_id}}
-        result = await self.app.ainvoke(initial_state, config)
+        
+        # Use update_state to save without running nodes
+        # This avoids the sales_agent generating an extra response
+        await self.app.aupdate_state(config, initial_state)
         
         return {
             "conversation_id": conversation_id,
-            "message": "¡Hola! Soy Taylor, tu asistente de ventas. ¿En qué puedo ayudarte hoy?",
-            "reasoning_trace": result.get("reasoning_trace", [])
+            "message": welcome_message["content"],
+            "reasoning_trace": []
         }
     
     async def process_message(
@@ -208,13 +237,29 @@ class SalesGraph:
         try:
             current_state = self.app.get_state(config)
             state_values = current_state.values if current_state else {}
-        except:
+            print(f"[GRAPH] Estado obtenido del checkpointer: {bool(current_state)}")
+            print(f"[GRAPH] Keys en state_values: {list(state_values.keys()) if state_values else 'VACIO'}")
+        except Exception as e:
+            print(f"[GRAPH] ERROR obteniendo estado: {e}")
             state_values = {}
         
-        # Build input state
+        # Debug: Log current state messages
+        existing_messages = state_values.get("messages", [])
+        print(f"\n{'='*60}")
+        print(f"[GRAPH] PROCESO DE MENSAJE - {conversation_id}")
+        print(f"[GRAPH] Mensajes existentes en state: {len(existing_messages)}")
+        for i, msg in enumerate(existing_messages):
+            role = msg.get("role", "?")
+            content = msg.get("content", "")[:100]
+            print(f"[GRAPH] Existente {i+1} [{role}]: {content}...")
+        print(f"[GRAPH] Nuevo mensaje del usuario: {message[:100]}...")
+        print(f"{'='*60}\n")
+        
+        # Build input state - only pass the NEW user message
+        # The reducer will combine it with existing messages from the checkpointer
         input_state: AgentState = {
             "conversation_id": conversation_id,
-            "messages": state_values.get("messages", []) + [user_message],
+            "messages": [user_message],  # Only new message - reducer handles combining
             "user_context": state_values.get("user_context", {"user_id": user_id}),
             "reasoning_trace": [],
             "classification": "PENDING",
@@ -256,7 +301,8 @@ class SalesGraph:
             "requires_human": False,
             "cart": result.get("cart", []),
             "reasoning_trace": result.get("reasoning_trace", []),
-            "status": "completed"
+            "status": "completed",
+            "conversation_stage": result.get("conversation_stage", "discovery")
         }
     
     async def handle_human_response(

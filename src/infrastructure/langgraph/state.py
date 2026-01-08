@@ -62,12 +62,17 @@ def messages_reducer(existing: List[Message], new: List[Message]) -> List[Messag
     Custom reducer for messages that:
     1. Appends new messages to existing
     2. Keeps only the last 10 messages to prevent checkpoint bloat
+    
+    Note: We don't deduplicate here because that was causing context loss.
+    Deduplication should happen at the node level by passing messages: [] when not adding new messages.
     """
     if existing is None:
         existing = []
-    if new is None:
-        new = []
+    if new is None or len(new) == 0:
+        # No new messages, return existing as-is
+        return existing[-10:] if len(existing) > 10 else existing
     
+    # Simply combine - nodes should pass messages: [] when not adding new messages
     combined = existing + new
     
     # Keep only last 10 messages
@@ -124,3 +129,12 @@ class AgentState(TypedDict):
     current_node: str
     next_node: Optional[str]
     error: Optional[str]
+    
+    # Orchestrator - Conversation Stage & Metrics
+    conversation_stage: Optional[Literal["discovery", "proposal", "optimization", "commitment", "checkout", "completed"]]
+    stage_message_count: int  # Messages in current stage
+    total_products_shown: int
+    products_added_to_cart: int
+    products_removed_from_cart: int
+    hesitation_signals: int  # Count of hesitation patterns detected
+    orchestrator_intervention: Optional[str]  # Message injected by orchestrator

@@ -120,6 +120,7 @@ async def supervisor_node(state: AgentState) -> AgentState:
     if not messages:
         return {
             **state,
+            "messages": [],  # Don't add messages - prevent reducer duplication
             "classification": "SAFE",
             "current_node": "supervisor",
             "next_node": "sales_agent",
@@ -142,6 +143,7 @@ async def supervisor_node(state: AgentState) -> AgentState:
     if not last_message:
         return {
             **state,
+            "messages": [],  # Don't add messages - prevent reducer duplication
             "classification": "SAFE",
             "current_node": "supervisor",
             "next_node": "sales_agent",
@@ -200,6 +202,7 @@ async def supervisor_node(state: AgentState) -> AgentState:
         
         return {
             **state,
+            "messages": [],  # Don't add messages - prevent reducer duplication
             "classification": "UNSAFE",
             "escalation": escalation,
             "requires_human": True,
@@ -227,6 +230,7 @@ async def supervisor_node(state: AgentState) -> AgentState:
     
     return {
         **state,
+        "messages": [],  # Don't add messages - prevent reducer duplication
         "classification": "SAFE",
         "intent": intent,
         "escalation": None,

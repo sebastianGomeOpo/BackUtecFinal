@@ -597,9 +597,12 @@ async def reverse_logistics_agent_node(state: AgentState) -> AgentState:
             "result": {"response_preview": final_message[:100] if final_message else ""}
         })
         
+        # Return ONLY the new assistant message - the reducer will append it
+        new_message = {"role": "assistant", "content": final_message, "timestamp": datetime.utcnow().isoformat()}
+        
         return {
             **state,
-            "messages": [{"role": "assistant", "content": final_message}],
+            "messages": [new_message],
             "reasoning_trace": reasoning_steps,
             "current_node": "reverse_logistics_agent",
             "next_node": "memory_optimizer"
@@ -615,9 +618,12 @@ async def reverse_logistics_agent_node(state: AgentState) -> AgentState:
             "result": {"error": str(e)}
         })
         
+        # Return ONLY the new error message - the reducer will append it
+        error_msg = {"role": "assistant", "content": "Lo siento, ocurrio un error. Por favor intenta de nuevo.", "timestamp": datetime.utcnow().isoformat()}
+        
         return {
             **state,
-            "messages": [{"role": "assistant", "content": "Lo siento, ocurrio un error. Por favor intenta de nuevo."}],
+            "messages": [error_msg],
             "reasoning_trace": reasoning_steps,
             "current_node": "reverse_logistics_agent",
             "next_node": "memory_optimizer"

@@ -233,6 +233,7 @@ async def memory_optimizer_node(state: AgentState) -> AgentState:
     
     return {
         **state,
+        "messages": [],  # Don't add messages - prevent reducer duplication
         "compressed_history": new_summary,
         "current_node": "memory_optimizer",
         "next_node": None,

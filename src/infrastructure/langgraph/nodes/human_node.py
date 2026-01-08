@@ -55,6 +55,7 @@ async def human_node(state: AgentState) -> AgentState:
         # No escalation, shouldn't be here
         return {
             **state,
+            "messages": [],  # Don't add messages - prevent reducer duplication
             "current_node": "human_node",
             "next_node": "memory_optimizer",
             "reasoning_trace": [{
@@ -93,6 +94,7 @@ async def human_node(state: AgentState) -> AgentState:
         }
     }
     
+    # Return ONLY the new waiting message - the reducer will append it
     return {
         **state,
         "messages": [waiting_message],
@@ -136,6 +138,7 @@ async def process_human_response(
         
         return {
             **state,
+            "messages": [],  # Don't add messages - prevent reducer duplication
             "requires_human": False,
             "escalation": {**escalation, "status": "approved"},
             "current_node": "human_node",
@@ -166,6 +169,7 @@ async def process_human_response(
             "result": {"action": "rewritten", "response_length": len(supervisor_response)}
         }
         
+        # Return ONLY the new supervisor message - the reducer will append it
         return {
             **state,
             "messages": [supervisor_message],
@@ -199,6 +203,7 @@ async def process_human_response(
             "result": {"action": "rejected"}
         }
         
+        # Return ONLY the new rejection message - the reducer will append it
         return {
             **state,
             "messages": [rejection_message],

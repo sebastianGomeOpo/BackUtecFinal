@@ -116,6 +116,7 @@ async def context_injector_node(state: AgentState) -> AgentState:
     
     return {
         **state,
+        "messages": [],  # Don't add any messages - pass empty to prevent reducer duplication
         "user_context": user_context,
         "reasoning_trace": [reasoning],
         "current_node": "context_injector",
