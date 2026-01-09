@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     chroma_persist_dir: str = "./data/chroma_db"
 
     # OpenAI
-    openai_api_key: str
+    openai_api_key: str = ""  # Optional during development
     openai_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
 

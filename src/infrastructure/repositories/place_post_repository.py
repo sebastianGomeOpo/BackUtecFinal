@@ -148,7 +148,7 @@ class SQLAlchemyPlacePostRepository(IPlacePostRepository):
             sponsor=model.sponsor,
             tags=model.tags or [],
             created_at=model.created_at,
-            metadata=model.metadata or {},
+            metadata=model.meta_data or {},
         )
 
     @staticmethod
@@ -166,5 +166,5 @@ class SQLAlchemyPlacePostRepository(IPlacePostRepository):
             neighborhood=entity.location.neighborhood,
             sponsor=entity.sponsor,
             tags=entity.tags,
-            metadata=entity.metadata,
+            meta_data=entity.metadata,
         )

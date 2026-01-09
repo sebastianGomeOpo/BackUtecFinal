@@ -145,7 +145,7 @@ class SQLAlchemyProductRepository(IProductRepository):
             sku=model.sku,
             images=model.images or [],
             specifications=model.specifications or {},
-            metadata=model.metadata or {},
+            metadata=model.meta_data or {},
         )
 
     @staticmethod
@@ -161,5 +161,5 @@ class SQLAlchemyProductRepository(IProductRepository):
             sku=entity.sku,
             images=entity.images,
             specifications=entity.specifications,
-            metadata=entity.metadata,
+            meta_data=entity.metadata,
         )

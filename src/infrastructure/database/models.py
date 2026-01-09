@@ -28,7 +28,7 @@ class ProductModel(Base):
     sku = Column(String, nullable=False, unique=True, index=True)
     images = Column(JSON, default=[])  # List of image URLs
     specifications = Column(JSON, default={})  # Product specifications
-    metadata = Column(JSON, default={})  # Additional metadata
+    meta_data = Column(JSON, default={})  # Additional metadata
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -148,7 +148,7 @@ class DistrictModel(Base):
     delivery_cost = Column(Float, nullable=False)
     min_purchase = Column(Float, default=0.0)
     active = Column(Boolean, default=True)
-    metadata = Column(JSON, default={})
+    meta_data = Column(JSON, default={})
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -205,7 +205,7 @@ class PlacePostModel(Base):
     neighborhood = Column(String, nullable=True)
     sponsor = Column(String, default="Coca-Cola Andina")
     tags = Column(JSON, default=[])
-    metadata = Column(JSON, default={})
+    meta_data = Column(JSON, default={})
     created_at = Column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (
