@@ -4,8 +4,7 @@ Compiles the graph with all nodes and edges
 """
 from typing import Dict, Any, Optional
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.mongodb import MongoDBSaver
-from pymongo import MongoClient
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from .state import AgentState
 from src.config import settings
 from .nodes.context_injector import context_injector_node
@@ -159,13 +158,9 @@ class SalesGraph:
     
     def __init__(self):
         self.graph = create_sales_graph()
-        # Use MongoDB for checkpoint persistence
+        # Use SQLite for checkpoint persistence (local)
         # State size is controlled by custom reducers in state.py
-        self.mongo_client = MongoClient(settings.mongodb_uri)
-        self.checkpointer = MongoDBSaver(
-            self.mongo_client,
-            db_name=settings.mongodb_db_name
-        )
+        self.checkpointer = AsyncSqliteSaver.from_conn_string("./data/checkpoints.db")
         self.app = self.graph.compile(
             checkpointer=self.checkpointer,
             interrupt_before=["human_node"]  # RF-HIT-01: Interrupt before human node

@@ -10,37 +10,25 @@ pydantic-settings==2.7.1
 python-socketio==5.12.0
 websockets==14.1
 
-# OpenAI - NO SDK (using pure HTTP with httpx)
-# openai==1.59.8  # Removed - using direct API calls
+# Database (Local SQLite)
+sqlalchemy>=2.0.0
+aiosqlite>=0.20.0
 
-# Gemini (for POC4 - Video multimodal)
-google-genai==1.0.0
-
-# Video Processing (for POC4)
-opencv-python==4.10.0.84
-numpy==2.2.5
-
-# Vector Store (compatible con Python 3.13)
-pinecone==6.0.0
-
-# Database
-motor>=3.7.0
-pymongo>=4.12,<4.16
-# redis==5.2.1  # Removed - OpenAI manages conversation state
+# Vector Store (Local ChromaDB)
+chromadb>=0.5.20
 
 # HTTP Client
 httpx==0.28.1
 aiohttp==3.11.11
 
-# AWS S3 Compatible (for Cloudflare R2)
-boto3>=1.34.0
-aioboto3>=12.0.0
-
 # LangGraph
 langgraph>=1.0.5
 langchain-core>=1.2.5
 langchain-openai>=0.3.0
-langgraph-checkpoint-mongodb>=0.3.0
+langgraph-checkpoint-sqlite>=1.0.0
+
+# LangSmith (Observability)
+langsmith>=0.2.0
 
 # Utilities
 python-jose[cryptography]==3.3.0

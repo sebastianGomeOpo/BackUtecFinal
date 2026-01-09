@@ -24,8 +24,7 @@ class ProxyHeadersMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-from ..infrastructure.database.mongodb import MongoDB
-from ..infrastructure.vectorstore.pinecone_store import PineconeStore
+from ..infrastructure.database.sqlite_db import Database
 from .routes import products, health, download, receipt, agent, images, audio, tts
 
 
@@ -35,33 +34,28 @@ async def lifespan(app: FastAPI):
     # Startup
     print("🚀 Starting Sales Agent API with LangGraph...")
     print("📡 Architecture: SalesAgent + Supervisor + Human-in-the-Loop")
-    
+    print("💾 Database: SQLite (Local)")
+    print("🔍 Vector Store: ChromaDB (Local)")
+
     # Connect to databases with error handling
     try:
-        await MongoDB.connect()
-        print("✅ MongoDB Atlas connected successfully")
+        await Database.connect()
+        print("✅ SQLite database connected successfully")
     except Exception as e:
-        print(f"⚠️  MongoDB connection failed: {e}")
-        print("⚠️  API will start anyway, but database operations will fail")
-    
-    try:
-        await PineconeStore.initialize()
-        print("✅ Pinecone (Products RAG) initialized successfully")
-    except Exception as e:
-        print(f"⚠️  Pinecone initialization failed: {e}")
-        print("⚠️  API will start anyway, but vector operations will fail")
-    
+        print(f"❌ SQLite connection failed: {e}")
+        raise
+
     print("✅ API startup complete")
-    
+
     yield
-    
+
     # Shutdown
     print("🛑 Shutting down Sales Agent API...")
     try:
-        await MongoDB.disconnect()
-        print("✅ MongoDB disconnected")
+        await Database.disconnect()
+        print("✅ SQLite disconnected")
     except Exception as e:
-        print(f"⚠️  MongoDB disconnect error: {e}")
+        print(f"⚠️  SQLite disconnect error: {e}")
     print("✅ All services stopped gracefully")
 
 
