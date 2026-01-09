@@ -26,45 +26,45 @@ class ProxyHeadersMiddleware(BaseHTTPMiddleware):
 
 from ..infrastructure.database.sqlite_db import Database
 from ..infrastructure.vectorstore.chroma_store import ChromaStore
-from .routes import products, health, download, receipt, agent, images, audio, tts
+from .routes import products, health, download, receipt, agent, audio, tts
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events"""
     # Startup
-    print("🚀 Starting Sales Agent API with LangGraph...")
-    print("📡 Architecture: SalesAgent + Supervisor + Human-in-the-Loop")
-    print("💾 Database: SQLite (Local)")
-    print("🔍 Vector Store: ChromaDB (Local)")
+    print("[STARTUP] Starting Sales Agent API with LangGraph...")
+    print("[STARTUP] Architecture: SalesAgent + Supervisor + Human-in-the-Loop")
+    print("[STARTUP] Database: SQLite (Local)")
+    print("[STARTUP] Vector Store: ChromaDB (Local)")
 
     # Connect to databases with error handling
     try:
         await Database.connect()
-        print("✅ SQLite database connected successfully")
+        print("[OK] SQLite database connected successfully")
     except Exception as e:
-        print(f"❌ SQLite connection failed: {e}")
+        print(f"[ERROR] SQLite connection failed: {e}")
         raise
 
     try:
         await ChromaStore.initialize(settings.chroma_persist_dir)
-        print("✅ ChromaDB vector store initialized successfully")
+        print("[OK] ChromaDB vector store initialized successfully")
     except Exception as e:
-        print(f"⚠️  ChromaDB initialization failed: {e}")
-        print("⚠️  API will start anyway, but semantic search will fail")
+        print(f"[WARN] ChromaDB initialization failed: {e}")
+        print("[WARN] API will start anyway, but semantic search will fail")
 
-    print("✅ API startup complete")
+    print("[OK] API startup complete")
 
     yield
 
     # Shutdown
-    print("🛑 Shutting down Sales Agent API...")
+    print("[SHUTDOWN] Shutting down Sales Agent API...")
     try:
         await Database.disconnect()
-        print("✅ SQLite disconnected")
+        print("[OK] SQLite disconnected")
     except Exception as e:
-        print(f"⚠️  SQLite disconnect error: {e}")
-    print("✅ All services stopped gracefully")
+        print(f"[WARN] SQLite disconnect error: {e}")
+    print("[OK] All services stopped gracefully")
 
 
 def create_app() -> FastAPI:
@@ -99,7 +99,7 @@ def create_app() -> FastAPI:
     app.include_router(products.router, prefix="/api/products", tags=["Products"])
     app.include_router(download.router, prefix="/api/download", tags=["Download"])
     app.include_router(receipt.router, prefix="/api", tags=["Receipt"])
-    app.include_router(images.router, prefix="/api/images", tags=["Images"])
+    # Images router removed (R2 dependency eliminated)
     app.include_router(audio.router, prefix="/api/audio", tags=["Audio"])
     app.include_router(tts.router, prefix="/api/tts", tags=["TTS"])
     

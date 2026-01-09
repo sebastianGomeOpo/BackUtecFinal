@@ -5,11 +5,11 @@ from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, or_
 from ...domain.entities import Product
-from ...domain.repositories import IProductRepository
 from ..database.models import ProductModel
+from ..database.sqlite_db import Database
 
 
-class SQLAlchemyProductRepository(IProductRepository):
+class SQLAlchemyProductRepository:
     """SQLAlchemy implementation of product repository"""
 
     def __init__(self, session: AsyncSession):
@@ -163,3 +163,112 @@ class SQLAlchemyProductRepository(IProductRepository):
             specifications=entity.specifications,
             meta_data=entity.metadata,
         )
+
+
+class MongoProductRepository:
+    """
+    MongoDB-compatible wrapper for SQLAlchemyProductRepository.
+    Manages its own session internally for backward compatibility.
+    """
+
+    async def _get_repo(self) -> tuple[SQLAlchemyProductRepository, AsyncSession]:
+        """Get a repository with its own session"""
+        session_gen = Database.get_session()
+        session = await anext(session_gen)
+        return SQLAlchemyProductRepository(session), session
+
+    async def get_by_id(self, product_id: str) -> Optional[Product]:
+        """Get product by ID"""
+        repo, session = await self._get_repo()
+        try:
+            return await repo.get_by_id(product_id)
+        finally:
+            await session.close()
+
+    async def get_by_sku(self, sku: str) -> Optional[Product]:
+        """Get product by SKU"""
+        repo, session = await self._get_repo()
+        try:
+            return await repo.get_by_sku(sku)
+        finally:
+            await session.close()
+
+    async def search(self, query: str, limit: int = 10) -> List[Product]:
+        """Search products"""
+        repo, session = await self._get_repo()
+        try:
+            return await repo.search(query, limit)
+        finally:
+            await session.close()
+
+    async def check_stock(self, product_id: str) -> int:
+        """Check product stock"""
+        repo, session = await self._get_repo()
+        try:
+            return await repo.check_stock(product_id)
+        finally:
+            await session.close()
+
+    async def get_price(self, product_id: str) -> float:
+        """Get product price"""
+        repo, session = await self._get_repo()
+        try:
+            return await repo.get_price(product_id)
+        finally:
+            await session.close()
+
+    async def get_by_category(self, category: str, limit: int = 10) -> List[Product]:
+        """Get products by category"""
+        repo, session = await self._get_repo()
+        try:
+            return await repo.get_by_category(category, limit)
+        finally:
+            await session.close()
+
+    async def get_by_ids(self, product_ids: List[str], limit: int = 100) -> List[Product]:
+        """Get products by multiple IDs"""
+        repo, session = await self._get_repo()
+        try:
+            return await repo.get_by_ids(product_ids, limit)
+        finally:
+            await session.close()
+
+    async def list_all(self, limit: int = 100) -> List[Product]:
+        """List all products"""
+        repo, session = await self._get_repo()
+        try:
+            return await repo.list_all(limit)
+        finally:
+            await session.close()
+
+    async def create(self, product: Product) -> Product:
+        """Create a new product"""
+        repo, session = await self._get_repo()
+        try:
+            return await repo.create(product)
+        finally:
+            await session.close()
+
+    async def update(self, product: Product) -> Product:
+        """Update existing product"""
+        repo, session = await self._get_repo()
+        try:
+            return await repo.update(product)
+        finally:
+            await session.close()
+
+    async def update_stock(self, product_id: str, quantity: int) -> None:
+        """Update product stock"""
+        repo, session = await self._get_repo()
+        try:
+            await repo.update_stock(product_id, quantity)
+        finally:
+            await session.close()
+
+    async def delete(self, product_id: str) -> bool:
+        """Delete a product"""
+        repo, session = await self._get_repo()
+        try:
+            return await repo.delete(product_id)
+        finally:
+            await session.close()

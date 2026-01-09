@@ -53,3 +53,15 @@ logs/
 data/
 chroma_db/
 *.chromadb/
+
+# OS Files
+.DS_Store
+Thumbs.db
+nul
+
+# Temp files
+*.tmp
+*.bak
+
+# Claude
+.claude/

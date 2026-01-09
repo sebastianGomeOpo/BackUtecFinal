@@ -10,7 +10,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Tool
 from langchain_openai import ChatOpenAI
 from ..state import AgentState
 from ....config import settings
-from ...vectorstore.pinecone_store import PineconeStore
+from ...vectorstore.chroma_store import ChromaStore
 from ...database.mongodb import MongoDB
 
 
@@ -409,10 +409,8 @@ async def search_return_knowledge(query: str) -> str:
         query: Consulta de busqueda (ej: 'devolucion producto danado')
     """
     try:
-        vectorstore = PineconeStore()
-        
-        # Search in Pinecone for relevant knowledge
-        results = await vectorstore.search_products(query=query, top_k=3)
+        # Search in ChromaDB for relevant knowledge
+        results = await ChromaStore.search_products(query=query, top_k=3)
         
         # For now, return general guidance based on query
         # In production, this would search a dedicated knowledge index

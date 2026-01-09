@@ -237,14 +237,34 @@ class ConversationModel(Base):
 
 def configure_sqlite(dbapi_conn, connection_record):
     """Enable WAL mode for SQLite"""
-    if dbapi_conn.driver == "pysqlite":
-        cursor = dbapi_conn.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.close()
+    try:
+        # Handle both regular and async connections
+        if hasattr(dbapi_conn, "driver"):
+            if dbapi_conn.driver == "pysqlite":
+                cursor = dbapi_conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.close()
+        else:
+            # AsyncAdapt connection - try to configure anyway
+            try:
+                cursor = dbapi_conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.close()
+            except:
+                # If it fails, skip silently
+                pass
+    except Exception as e:
+        print(f"[SQLite] Warning: Could not configure SQLite pragmas: {e}")
 
 
 def register_sqlite_pragma(engine):
     """Register SQLite pragma configuration"""
     if "sqlite" in str(engine.url):
-        event.listen(engine, "connect", configure_sqlite)
+        # For AsyncEngine, use sync_engine instead
+        try:
+            event.listen(engine.sync_engine, "connect", configure_sqlite)
+        except:
+            # If sync_engine doesn't exist, skip pragma registration
+            pass

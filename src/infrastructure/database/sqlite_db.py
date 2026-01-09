@@ -50,9 +50,9 @@ class Database:
                 autoflush=False,
             )
 
-            # Create all tables
+            # Create all tables (checkfirst=True to avoid errors if they exist)
             async with cls.engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+                await conn.run_sync(Base.metadata.create_all, checkfirst=True)
 
             logger.info(f"✅ SQLite database initialized: {settings.database_url}")
 

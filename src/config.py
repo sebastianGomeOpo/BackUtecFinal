@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     # ChromaDB (Local Vector Store)
     chroma_persist_dir: str = "./data/chroma_db"
 
+    # Static Images (Local - placeholder fallback)
+    static_images_dir: str = "./data/images"
+
     # OpenAI
     openai_api_key: str = ""  # Optional during development
     openai_model: str = "gpt-4o-mini"
@@ -45,6 +48,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = False
+        extra = "ignore"  # Ignore extra fields from .env
     
     @property
     def cors_origins_list(self) -> List[str]:

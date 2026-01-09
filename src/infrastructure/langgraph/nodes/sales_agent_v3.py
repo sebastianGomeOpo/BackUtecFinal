@@ -16,11 +16,13 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Tool
 from langchain_openai import ChatOpenAI
 from ..state import AgentState
 from ....config import settings
-from ...vectorstore.pinecone_store import PineconeStore
+from ...vectorstore.chroma_store import ChromaStore
 from ...repositories.product_repository import MongoProductRepository
 from ...services.stock_reservation import get_stock_service
-from ...services.cloudflare_r2 import get_r2_service
 from ...database.mongodb import MongoDB
+
+# Placeholder image for products (R2 removed)
+PLACEHOLDER_IMG = "https://img.freepik.com/vector-premium/vector-icono-imagen-predeterminado-pagina-imagen-faltante-diseno-sitio-web-o-aplicacion-movil-no-hay-foto-disponible_87543-11093.jpg"
 from .memory_optimizer import get_memory_state
 from ...services.upstash_redis import get_redis
 
@@ -492,14 +494,12 @@ async def search_products(query: str, limit: int = 5, max_price: float = None) -
     try:
         ctx = get_tool_context()
         conversation_id = ctx["conversation_id"]
-        
-        vectorstore = PineconeStore()
+
         stock_service = get_stock_service()
-        r2_service = get_r2_service()
-        
+
         # Search for more results to filter (we filter by name/category match and optionally by price)
         search_limit = limit * 5  # Get more results since we'll filter strictly
-        results = await vectorstore.search_products(query=query, top_k=search_limit)
+        results = await ChromaStore.search_products(query=query, top_k=search_limit)
         
         if not results:
             return json.dumps({
@@ -562,16 +562,10 @@ async def search_products(query: str, limit: int = 5, max_price: float = None) -
                     continue
                 
                 available_stock = await stock_service.get_available_stock(product_id)
-                
-                image_key = product.get("image_key", "")
-                placeholder_img = "https://img.freepik.com/vector-premium/vector-icono-imagen-predeterminado-pagina-imagen-faltante-diseno-sitio-web-o-aplicacion-movil-no-hay-foto-disponible_87543-11093.jpg"
-                image_url = placeholder_img
-                if image_key:
-                    try:
-                        image_url = r2_service.get_signed_url(image_key, expires_in=3600) or placeholder_img
-                    except:
-                        image_url = placeholder_img
-                
+
+                # Use placeholder image (R2 removed)
+                image_url = PLACEHOLDER_IMG
+
                 products.append({
                     "id": product_id,
                     "name": product.get("name"),
@@ -703,16 +697,9 @@ async def get_product_details(product_code: str) -> str:
         stock_service = get_stock_service()
         available_stock = await stock_service.get_available_stock(product_id)
         
-        r2_service = get_r2_service()
-        placeholder_img = "https://img.freepik.com/vector-premium/vector-icono-imagen-predeterminado-pagina-imagen-faltante-diseno-sitio-web-o-aplicacion-movil-no-hay-foto-disponible_87543-11093.jpg"
-        image_url = placeholder_img
-        image_key = product.get("image_key", "")
-        if image_key:
-            try:
-                image_url = r2_service.get_signed_url(image_key, expires_in=3600) or placeholder_img
-            except:
-                pass
-        
+        # Use placeholder image (R2 removed)
+        image_url = PLACEHOLDER_IMG
+
         # Build detailed HTML card with modern design
         sku = product.get("sku", "N/A")
         stock_status = f'<span style="color:#059669;font-weight:600;">{available_stock} disponibles</span>' if available_stock > 0 else '<span style="color:#dc2626;font-weight:600;">Sin stock</span>'
@@ -1318,11 +1305,10 @@ async def create_budget_proposal(budget: float, room_type: str = "general") -> s
         }
         
         search_terms = room_essentials.get(room_type.lower(), room_essentials["general"])
-        
+
         all_products = []
-        pinecone_store = PineconeStore()
         for term in search_terms:
-            results = await pinecone_store.search_products(term, top_k=5)
+            results = await ChromaStore.search_products(term, top_k=5)
             for p in results:
                 if p.get("stock", 0) > 0 and p.get("price", 0) > 0:
                     all_products.append(p)
@@ -1418,21 +1404,16 @@ async def create_budget_proposal(budget: float, room_type: str = "general") -> s
         except Exception as e:
             print(f"[PRODUCTS] Failed to save to Redis: {e}")
         
-        r2_service = get_r2_service()
-        placeholder_img = "https://img.freepik.com/vector-premium/vector-icono-imagen-predeterminado-pagina-imagen-faltante-diseno-sitio-web-o-aplicacion-movil-no-hay-foto-disponible_87543-11093.jpg"
+        # Use placeholder image (R2 removed)
         cards = []
         for idx, p in enumerate(proposal, 1):
             sku = p.get("sku", "N/A")
-            try:
-                image_key = f"products/{p['product_id']}.jpg"
-                image_url = r2_service.get_signed_url(image_key) if r2_service else placeholder_img
-            except:
-                image_url = placeholder_img
+            image_url = PLACEHOLDER_IMG
             
             cards.append(f'''
             <div class="product-card" data-code="{sku}" data-sku="{sku}" data-index="{idx}" style="background:white;border-radius:12px;border:1px solid #e5e7eb;overflow:hidden;transition:all 0.3s ease;display:flex;flex-direction:column;" onmouseover="this.style.transform='translateY(-4px)';this.style.boxShadow='0 12px 24px rgba(0,0,0,0.12)';this.style.borderColor='#4F46E5'" onmouseout="this.style.transform='translateY(0)';this.style.boxShadow='none';this.style.borderColor='#e5e7eb'">
                 <div style="position:relative;">
-                    <img src="{image_url}" onerror="this.src='{placeholder_img}'" style="width:100%;height:160px;object-fit:cover;">
+                    <img src="{image_url}" onerror="this.src='{PLACEHOLDER_IMG}'" style="width:100%;height:160px;object-fit:cover;">
                     <span style="position:absolute;top:8px;left:8px;background:rgba(79,70,229,0.95);color:white;font-size:10px;font-weight:600;padding:4px 10px;border-radius:20px;">{p["category"]}</span>
                 </div>
                 <div style="padding:14px;flex:1;display:flex;flex-direction:column;">
@@ -1599,8 +1580,7 @@ async def get_cross_sell_recommendations(product_id: str = "") -> str:
         
         db = MongoDB.get_database()
         stock_service = get_stock_service()
-        pinecone_store = PineconeStore()
-        
+
         # Get cart to find what to cross-sell
         cart = await stock_service.get_cart_total(conversation_id)
         if not cart.get("items") and not product_id:
@@ -1653,7 +1633,7 @@ async def get_cross_sell_recommendations(product_id: str = "") -> str:
         base_product_id = base_product.get("id") or base_product.get("product_id")
         
         for cat in related_categories[:2]:
-            results = await pinecone_store.search_products(cat, top_k=5)
+            results = await ChromaStore.search_products(cat, top_k=5)
             for p in results:
                 pid = p.get("id") or p.get("product_id")
                 # Skip the base product
@@ -1690,23 +1670,18 @@ async def get_cross_sell_recommendations(product_id: str = "") -> str:
         if not recommendations:
             return json.dumps({"success": True, "recommendations": [], "message": "No hay recomendaciones disponibles"})
         
-        # Generate HTML with grid layout
-        r2_service = get_r2_service()
-        placeholder_img = "https://img.freepik.com/vector-premium/vector-icono-imagen-predeterminado-pagina-imagen-faltante-diseno-sitio-web-o-aplicacion-movil-no-hay-foto-disponible_87543-11093.jpg"
+        # Generate HTML with grid layout (R2 removed - using placeholder)
         cards = []
         for idx, p in enumerate(recommendations, 1):
             sku = p.get("sku", "N/A")
-            try:
-                image_url = r2_service.get_signed_url(f"products/{p['product_id']}.jpg") if r2_service else placeholder_img
-            except:
-                image_url = placeholder_img
+            image_url = PLACEHOLDER_IMG
             stars = "★" * int(p["rating"]) + "☆" * (5 - int(p["rating"]))
             stock_badge = f'<span style="color:#dc2626;font-size:9px;font-weight:600;">Solo {p["stock"]} disponibles</span>' if p["stock"] < 10 else f'<span style="color:#059669;font-size:9px;">{p["stock"]} disponibles</span>'
             
             cards.append(f'''
             <div class="product-card" data-code="{sku}" data-sku="{sku}" style="background:white;border-radius:12px;border:1px solid #fcd34d;overflow:hidden;transition:all 0.3s ease;display:flex;flex-direction:column;" onmouseover="this.style.transform='translateY(-4px)';this.style.boxShadow='0 12px 24px rgba(245,158,11,0.2)';this.style.borderColor='#f59e0b'" onmouseout="this.style.transform='translateY(0)';this.style.boxShadow='none';this.style.borderColor='#fcd34d'">
                 <div style="position:relative;">
-                    <img src="{image_url}" onerror="this.src='{placeholder_img}'" style="width:100%;height:140px;object-fit:cover;">
+                    <img src="{image_url}" onerror="this.src='{PLACEHOLDER_IMG}'" style="width:100%;height:140px;object-fit:cover;">
                     <span style="position:absolute;top:8px;right:8px;background:#f59e0b;color:white;font-size:9px;font-weight:600;padding:3px 8px;border-radius:12px;">Recomendado</span>
                 </div>
                 <div style="padding:12px;flex:1;display:flex;flex-direction:column;">
