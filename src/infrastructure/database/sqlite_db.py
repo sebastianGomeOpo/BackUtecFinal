@@ -73,8 +73,22 @@ class Database:
         if cls.async_session_maker is None:
             raise RuntimeError("Database not initialized. Call connect() first.")
 
-        async with cls.async_session_maker() as session:
+        session = cls.async_session_maker()
+        try:
             yield session
+            await session.commit()
+        except GeneratorExit:
+            # Generator was closed early - don't try to close session normally
+            pass
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            try:
+                await session.close()
+            except Exception:
+                # Ignore close errors if session is in invalid state
+                pass
 
     @classmethod
     async def execute_query(cls, statement):

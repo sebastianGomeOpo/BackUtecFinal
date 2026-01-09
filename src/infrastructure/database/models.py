@@ -231,6 +231,19 @@ class ConversationModel(Base):
     )
 
 
+class UserModel(Base):
+    """User profile model for guest and registered users"""
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True)
+    user_id = Column(String, nullable=False, unique=True, index=True)
+    name = Column(String, nullable=False, default="Guest")
+    preferences = Column(JSON, default={})
+    purchase_history = Column(JSON, default=[])
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 # ============================================================================
 # Enable SQLite WAL mode for better concurrency
 # ============================================================================

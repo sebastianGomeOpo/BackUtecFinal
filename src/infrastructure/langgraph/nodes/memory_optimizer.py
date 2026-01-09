@@ -56,6 +56,13 @@ async def get_memory_state(conversation_id: str) -> Dict[str, Any]:
             memory = await redis.get_memory(conversation_id)
             elapsed = (time.time() - start) * 1000
             print(f"[MEMORY] get_memory_state from Redis: {elapsed:.2f}ms")
+            if not memory:
+                return {
+                    "summary": "",
+                    "messages_since_summary": 0,
+                    "total_messages": 0,
+                    "summary_count": 0
+                }
             return memory
         except Exception as e:
             print(f"[MEMORY] Redis error, falling back to MongoDB: {e}")

@@ -2846,7 +2846,7 @@ async def sales_agent_node_v3(state: AgentState) -> AgentState:
     
     # Get memory state (resumen de conversación anterior)
     memory_state = await get_memory_state(conversation_id)
-    conversation_summary = memory_state.get("summary", "")
+    conversation_summary = memory_state.get("summary", "") if memory_state else ""
     
     if conversation_summary:
         print(f"\n[AGENT] Inyectando resumen de memoria ({len(conversation_summary)} chars)")

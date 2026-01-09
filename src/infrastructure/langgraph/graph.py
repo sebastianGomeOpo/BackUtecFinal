@@ -4,7 +4,7 @@ Compiles the graph with all nodes and edges
 """
 from typing import Dict, Any, Optional
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.memory import MemorySaver
 from .state import AgentState
 from src.config import settings
 from .nodes.context_injector import context_injector_node
@@ -155,12 +155,11 @@ class SalesGraph:
     Wrapper class for the Sales Agent Graph
     Provides methods for running the graph and handling human intervention
     """
-    
+
     def __init__(self):
         self.graph = create_sales_graph()
-        # Use SQLite for checkpoint persistence (local)
-        # State size is controlled by custom reducers in state.py
-        self.checkpointer = AsyncSqliteSaver.from_conn_string("./data/checkpoints.db")
+        # Use MemorySaver for in-memory checkpoint persistence
+        self.checkpointer = MemorySaver()
         self.app = self.graph.compile(
             checkpointer=self.checkpointer,
             interrupt_before=["human_node"]  # RF-HIT-01: Interrupt before human node
@@ -230,7 +229,7 @@ class SalesGraph:
         config = {"configurable": {"thread_id": conversation_id}}
         
         try:
-            current_state = self.app.get_state(config)
+            current_state = await self.app.aget_state(config)
             state_values = current_state.values if current_state else {}
             print(f"[GRAPH] Estado obtenido del checkpointer: {bool(current_state)}")
             print(f"[GRAPH] Keys en state_values: {list(state_values.keys()) if state_values else 'VACIO'}")
@@ -308,16 +307,16 @@ class SalesGraph:
     ) -> Dict[str, Any]:
         """
         RF-HIT-02: Handle human supervisor response
-        
+
         Actions:
         - approve: Continue with original flow
         - rewrite: Use supervisor's custom response
         - reject: End conversation
         """
         config = {"configurable": {"thread_id": conversation_id}}
-        
+
         try:
-            current_state = self.app.get_state(config)
+            current_state = await self.app.aget_state(config)
             state_values = current_state.values if current_state else {}
         except:
             return {"error": "Conversation not found"}
@@ -349,9 +348,9 @@ class SalesGraph:
     async def get_reasoning_trace(self, conversation_id: str) -> list:
         """Get full reasoning trace for a conversation"""
         config = {"configurable": {"thread_id": conversation_id}}
-        
+
         try:
-            current_state = self.app.get_state(config)
+            current_state = await self.app.aget_state(config)
             return current_state.values.get("reasoning_trace", []) if current_state else []
         except:
             return []

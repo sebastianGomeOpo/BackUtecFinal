@@ -32,11 +32,20 @@ from .routes import products, health, download, receipt, agent, audio, tts
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan events"""
+    import os
     # Startup
     print("[STARTUP] Starting Sales Agent API with LangGraph...")
     print("[STARTUP] Architecture: SalesAgent + Supervisor + Human-in-the-Loop")
     print("[STARTUP] Database: SQLite (Local)")
     print("[STARTUP] Vector Store: ChromaDB (Local)")
+
+    # LangSmith status
+    langsmith_enabled = os.getenv("LANGCHAIN_TRACING_V2", "").lower() == "true"
+    langsmith_project = os.getenv("LANGCHAIN_PROJECT", "default")
+    if langsmith_enabled:
+        print(f"[STARTUP] LangSmith: ENABLED (project: {langsmith_project})")
+    else:
+        print("[STARTUP] LangSmith: DISABLED")
 
     # Connect to databases with error handling
     try:

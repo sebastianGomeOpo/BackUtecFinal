@@ -14,7 +14,7 @@ from .sqlite_db import Database
 from .models import (
     OrderModel, OrderItemModel, CustomerModel, ConversationModel,
     ProductModel, CouponModel, DeliverySlotModel, DistrictModel,
-    EscalationModel, StockReservationModel
+    EscalationModel, StockReservationModel, UserModel
 )
 
 
@@ -205,6 +205,12 @@ class MongoCollection:
             elif key == "order_id" and hasattr(self.model_class, "order_number"):
                 result["order_number"] = value
             elif hasattr(self.model_class, key):
+                # Convert ISO datetime strings to datetime objects
+                if isinstance(value, str) and key in ("created_at", "updated_at", "expires_at", "valid_from", "valid_until", "resolved_at"):
+                    try:
+                        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    except (ValueError, AttributeError):
+                        pass
                 result[key] = value
         return result
 
@@ -226,6 +232,7 @@ class MongoDatabase:
             "districts": DistrictModel,
             "escalations": EscalationModel,
             "stock_reservations": StockReservationModel,
+            "users": UserModel,
         }
 
     def __getattr__(self, name: str) -> MongoCollection:

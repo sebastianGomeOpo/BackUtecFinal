@@ -1,0 +1,8 @@
+{
+  "$schema": "https://langchain-ai.github.io/langgraph/langgraph.json",
+  "dependencies": ["."],
+  "graphs": {
+    "sales_agent": "src.infrastructure.langgraph.graph:create_sales_graph"
+  },
+  "env": ".env"
+}

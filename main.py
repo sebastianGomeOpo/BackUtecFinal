@@ -1,6 +1,10 @@
 """
 Main entry point for the Sales Agent API
 """
+# Load environment variables FIRST (before any LangChain imports)
+from dotenv import load_dotenv
+load_dotenv()
+
 import uvicorn
 from src.presentation.api import create_app
 
