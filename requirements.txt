@@ -16,6 +16,7 @@ aiosqlite>=0.20.0
 
 # Vector Store (Local ChromaDB)
 chromadb>=0.5.20
+langchain-community>=0.3.0
 
 # HTTP Client
 httpx==0.28.1

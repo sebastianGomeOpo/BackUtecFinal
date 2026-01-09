@@ -25,6 +25,7 @@ class ProxyHeadersMiddleware(BaseHTTPMiddleware):
 
 
 from ..infrastructure.database.sqlite_db import Database
+from ..infrastructure.vectorstore.chroma_store import ChromaStore
 from .routes import products, health, download, receipt, agent, images, audio, tts
 
 
@@ -44,6 +45,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"❌ SQLite connection failed: {e}")
         raise
+
+    try:
+        await ChromaStore.initialize(settings.chroma_persist_dir)
+        print("✅ ChromaDB vector store initialized successfully")
+    except Exception as e:
+        print(f"⚠️  ChromaDB initialization failed: {e}")
+        print("⚠️  API will start anyway, but semantic search will fail")
 
     print("✅ API startup complete")
 
